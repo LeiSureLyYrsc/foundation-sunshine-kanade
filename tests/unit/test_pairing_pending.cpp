@@ -13,6 +13,7 @@
 #include <fstream>
 #include <future>
 #include <gtest/gtest.h>
+#include <iterator>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -26,9 +27,14 @@
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
 
+#ifdef _WIN32
+  #include <windows.h>
+#endif
+
 #include "src/config.h"
 #include "src/confighttp/pairing.h"
 #include "src/crypto.h"
+#include "src/httpcommon.h"
 #include "src/nvhttp.h"
 #include "src/nvhttp/pairing.h"
 #include "src/utility.h"
@@ -461,7 +467,9 @@ TEST_F(PairingPending, PairingTheSameCertificateAgainKeepsOneEntryAndItsUuid) {
     config::nvhttp.file_state = saved_state;
   });
 
-  nvhttp::add_paired_client_for_test("Named Zako", "CERT-A", {});
+  const auto first_cert = crypto::gen_creds("pairing-test-first", 2048).x509;
+  const auto second_cert = crypto::gen_creds("pairing-test-second", 2048).x509;
+  ASSERT_TRUE(nvhttp::add_paired_client_for_test("Named Zako", first_cert, {}));
   ASSERT_EQ(nvhttp::get_all_clients().size(), 1U);
   const auto uuid = nvhttp::get_all_clients().at(0).at("uuid").get<std::string>();
 
@@ -469,20 +477,119 @@ TEST_F(PairingPending, PairingTheSameCertificateAgainKeepsOneEntryAndItsUuid) {
   mac.family = client_family::family_e::moonlight_macos_enhanced;
   mac.os = "macos";
   mac.last_seen = 1762243200;
-  nvhttp::add_paired_client_for_test("Living room", "CERT-A", mac);
+  ASSERT_TRUE(nvhttp::add_paired_client_for_test("Living room", first_cert, mac));
   ASSERT_EQ(nvhttp::get_all_clients().size(), 1U);
   EXPECT_EQ(nvhttp::get_all_clients().at(0).at("uuid"), uuid);
   EXPECT_EQ(nvhttp::get_all_clients().at(0).at("name"), "Living room");
   EXPECT_EQ(nvhttp::get_all_clients().at(0).at("family"), "moonlight-macos-enhanced");
 
   // A pairing that observed nothing about the family does not erase what the entry already knows.
-  nvhttp::add_paired_client_for_test("Living room", "CERT-A", {});
+  ASSERT_TRUE(nvhttp::add_paired_client_for_test("Living room", first_cert, {}));
   ASSERT_EQ(nvhttp::get_all_clients().size(), 1U);
   EXPECT_EQ(nvhttp::get_all_clients().at(0).at("family"), "moonlight-macos-enhanced");
 
   // Another certificate is another device.
-  nvhttp::add_paired_client_for_test("Phone", "CERT-B", {});
+  ASSERT_TRUE(nvhttp::add_paired_client_for_test("Phone", second_cert, {}));
   EXPECT_EQ(nvhttp::get_all_clients().size(), 2U);
+}
+
+TEST_F(PairingPending, MissingHostIdMergesWithExistingCredentialsAndDevices) {
+  const auto prior_path = config::nvhttp.file_state;
+  const auto prior_id = http::unique_id;
+  const auto state = directory / "shared-state.json";
+  config::nvhttp.file_state = state.string();
+  const auto restore = util::fail_guard([&] {
+    nvhttp::erase_all_clients();
+    config::nvhttp.file_state = prior_path;
+    http::unique_id = prior_id;
+  });
+  const auto fixture = crypto::gen_creds("pairing-fixture", 2048);
+  const nlohmann::json devices = nlohmann::json::array({ {
+    { "uuid", "old-device" }, { "name", "Old" }, { "cert", fixture.x509 }, { "future", 7 },
+  } });
+  std::ofstream(state) << nlohmann::json {
+    { "username", "fixture-user" }, { "root", { { "named_devices", devices }, { "extra", true } } },
+  };
+  nvhttp::pairing::load_state();
+  const auto stable = http::unique_id;
+  ASSERT_FALSE(stable.empty());
+  ASSERT_EQ(nvhttp::get_all_clients().size(), 1U);
+  nvhttp::pairing::load_state();
+  EXPECT_EQ(http::unique_id, stable);
+  std::promise<void> start;
+  auto ready = start.get_future().share();
+  auto account = std::async(std::launch::async, [&] {
+    ready.wait();
+    return http::save_user_creds(state.string(), "new-fixture-user", "fixture-password");
+  });
+  auto device = std::async(std::launch::async, [&] {
+    ready.wait();
+    return nvhttp::add_paired_client_for_test("New display name", fixture.x509, {});
+  });
+  start.set_value();
+  ASSERT_EQ(account.get(), 0);
+  ASSERT_TRUE(device.get());
+  std::ifstream input { state };
+  const auto document = nlohmann::json::parse(input);
+  EXPECT_TRUE(document.value("username", "") == "new-fixture-user");
+  EXPECT_TRUE(document.contains("salt") && document.contains("password"));
+  EXPECT_TRUE(document.at("root").at("extra").get<bool>());
+  EXPECT_EQ(document.at("root").at("named_devices").at(0).at("future"), 7);
+  EXPECT_EQ(nvhttp::get_all_clients().at(0).at("uuid"), "old-device");
+}
+
+#ifdef _WIN32
+TEST_F(PairingPending, AtomicReplaceFailureDoesNotAddOrRemoveTrust) {
+  const auto prior_path = config::nvhttp.file_state;
+  const auto prior_id = http::unique_id;
+  const auto state = directory / "obstructed-state.json";
+  config::nvhttp.file_state = state.string();
+  const auto restore = util::fail_guard([&] {
+    nvhttp::erase_all_clients();
+    config::nvhttp.file_state = prior_path;
+    http::unique_id = prior_id;
+  });
+  const auto old_device = crypto::gen_creds("old-pairing-fixture", 2048);
+  const auto new_device = crypto::gen_creds("new-pairing-fixture", 2048);
+  nvhttp::pairing::load_state();
+  ASSERT_TRUE(nvhttp::add_paired_client_for_test("Already paired", old_device.x509, {}));
+  const auto blocker = CreateFileW(state.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  ASSERT_NE(blocker, INVALID_HANDLE_VALUE);
+  const auto close = util::fail_guard([&] { CloseHandle(blocker); });
+  EXPECT_FALSE(nvhttp::add_paired_client_for_test("Uncommitted", new_device.x509, {}));
+  auto old_cert = crypto::x509(old_device.x509);
+  auto new_cert = crypto::x509(new_device.x509);
+  EXPECT_EQ(nvhttp::pairing::verify_client_certificate(old_cert.get(), false), nullptr);
+  EXPECT_NE(nvhttp::pairing::verify_client_certificate(new_cert.get(), false), nullptr);
+  EXPECT_EQ(nvhttp::get_all_clients().size(), 1U);
+  for (const auto &entry : fs::directory_iterator(directory)) {
+    EXPECT_FALSE(entry.path().filename().string().starts_with("obstructed-state.json.tmp-"));
+  }
+}
+#endif
+
+TEST_F(PairingPending, DamagedStateIsNotReplacedAndDoesNotGrantNewTrust) {
+  const auto prior_path = config::nvhttp.file_state;
+  const auto prior_id = http::unique_id;
+  const auto state = directory / "broken-state.json";
+  config::nvhttp.file_state = state.string();
+  const auto restore = util::fail_guard([&] {
+    config::nvhttp.file_state = prior_path;
+    http::unique_id = prior_id;
+  });
+  constexpr auto damaged = "{ truncated fixture";
+  std::ofstream(state) << damaged;
+  nvhttp::pairing::load_state();
+  const auto fixture = crypto::gen_creds("pairing-fixture", 2048);
+  EXPECT_FALSE(nvhttp::add_paired_client_for_test("Uncommitted", fixture.x509, {}));
+  EXPECT_NE(http::save_user_creds(state.string(), "new-fixture-user", "fixture-password"), 0);
+  EXPECT_TRUE(nvhttp::get_all_clients().empty());
+  auto certificate = crypto::x509(fixture.x509);
+  EXPECT_NE(nvhttp::pairing::verify_client_certificate(certificate.get(), false), nullptr);
+  std::ifstream input { state };
+  const std::string persisted { std::istreambuf_iterator<char> { input }, std::istreambuf_iterator<char> {} };
+  EXPECT_TRUE(persisted == damaged);
 }
 
 TEST(PairingStateCompat, AReleasedStateFileLoadsEveryNamedDevice) {
@@ -502,6 +609,9 @@ TEST(PairingStateCompat, AReleasedStateFileLoadsEveryNamedDevice) {
       nvhttp::erase_all_clients();
       config::nvhttp.file_state = saved_state;
       std::error_code remove_error;
+      auto lock = copy;
+      lock += ".lock";
+      fs::remove(lock, remove_error);
       fs::remove(copy, remove_error);
     });
 

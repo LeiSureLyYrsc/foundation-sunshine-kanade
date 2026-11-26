@@ -352,7 +352,11 @@ namespace confighttp::clients {
       terminate_sessions_of_all(nvhttp::get_all_clients(), [](const std::string &uuid) {
         rtsp_stream::terminate_client_sessions(uuid);
       });
-      nvhttp::erase_all_clients();
+      if (!nvhttp::erase_all_clients()) {
+        outputTree.put("status", false);
+        outputTree.put("error", "Could not persist pairing state");
+        return;
+      }
       proc::proc.terminate();
       outputTree.put("status", true);
     }

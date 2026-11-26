@@ -17,9 +17,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#ifdef _WIN32
-  #include <windows.h>
-#endif
 
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
@@ -33,6 +30,7 @@
 #include "src/httpcommon.h"
 #include "src/logging.h"
 #include "src/network.h"
+#include "src/state_json.h"
 #include "src/tray/system_tray.h"
 #include "src/tray/tray_state.h"
 #include "src/utility.h"
@@ -182,120 +180,135 @@ namespace nvhttp {
     }
 
     bool
-    save_state(bool preserve_existing = true, const client_t *snapshot = nullptr) {
-      std::lock_guard mutation_lock { client_mutation_mutex };
-      pt::ptree root;
-      const auto state_path = state_file_path();
-
-      if (preserve_existing) {
-        try {
-          if (fs::exists(state_path)) {
-            std::ifstream state_file { state_path };
-            if (!state_file.is_open()) {
-              throw std::runtime_error("unable to open state file for reading");
-            }
-            pt::read_json(state_file, root);
+    valid_pairing_root(const nlohmann::json &document) {
+      const auto root = document.find("root");
+      if (root == document.end()) return true;
+      if (!root->is_object()) return false;
+      if (const auto id = root->find("uniqueid"); id != root->end() && (!id->is_string() || id->get_ref<const std::string &>().empty())) return false;
+      if (const auto named = root->find("named_devices"); named != root->end() && *named != "") {
+        if (!named->is_array()) return false;
+        std::map<std::string, bool> ids;
+        for (const auto &entry : *named) {
+          if (!entry.is_object()) return false;
+          for (const auto *key : { "uuid", "name", "cert" }) {
+            if (!entry.contains(key) || !entry[key].is_string()) return false;
+          }
+          if (entry["uuid"] == "" || !ids.emplace(entry["uuid"].get<std::string>(), true).second) return false;
+          if (const auto enabled = entry.find("enabled"); enabled != entry.end() && !enabled->is_boolean() &&
+              *enabled != "true" && *enabled != "false" && *enabled != "0" && *enabled != "1" &&
+              *enabled != 0 && *enabled != 1) return false;
+        }
+      }
+      if (const auto legacy = root->find("devices"); legacy != root->end() && *legacy != "") {
+        if (!legacy->is_array() && !legacy->is_object()) return false;
+        for (const auto &device : *legacy) {
+          if (!device.is_object()) return false;
+          if (const auto certs = device.find("certs"); certs != device.end() && *certs != "") {
+            if (!certs->is_array()) return false;
+            for (const auto &cert : *certs) if (!cert.is_string()) return false;
           }
         }
-        catch (std::exception &e) {
-          BOOST_LOG(error) << "Couldn't read "sv << config::nvhttp.file_state << ": "sv << e.what();
-          return false;
-        }
-      }
-
-      root.erase("root"s);
-
-      root.put("root.uniqueid", http::unique_id);
-      pt::ptree named_cert_nodes;
-      const auto serialize_devices = [&](const client_t &state) {
-        for (const auto &named_cert : state.named_devices) {
-          pt::ptree named_cert_node;
-          named_cert_node.put("name"s, named_cert.name);
-          named_cert_node.put("cert"s, named_cert.cert);
-          named_cert_node.put("uuid"s, named_cert.uuid);
-          named_cert_node.put("enabled", named_cert.enabled);
-          named_cert_node.put("last_session_ended"s, named_cert.last_session_ended);
-          named_cert_node.put("family"s, client_family::to_string(named_cert.family.family));
-          named_cert_node.put("family_version"s, named_cert.family.version);
-          named_cert_node.put("family_os"s, named_cert.family.os);
-          named_cert_node.put("family_source"s, named_cert.family.source);
-          named_cert_node.put("family_last_seen"s, named_cert.family.last_seen);
-          named_cert_node.put("family_rank"s, named_cert.family.rank);
-          named_cert_nodes.push_back(std::make_pair(""s, named_cert_node));
-        }
-      };
-      if (snapshot)
-        serialize_devices(*snapshot);
-      else {
-        std::shared_lock<std::shared_mutex> cl(client_state_mutex);
-        serialize_devices(client_root);
-      }
-      root.add_child("root.named_devices"s, named_cert_nodes);
-
-      try {
-        auto temporary_path = state_path;
-        temporary_path += ".tmp";
-        auto cleanup = util::fail_guard([&]() {
-          std::error_code ignored;
-          fs::remove(temporary_path, ignored);
-        });
-        std::ofstream state_file { temporary_path };
-        if (!state_file.is_open()) {
-          throw std::runtime_error("unable to open state file for writing");
-        }
-        pt::write_json(state_file, root);
-        state_file.flush();
-        if (!state_file) {
-          throw std::runtime_error("unable to write state file");
-        }
-        state_file.close();
-        if (!state_file) throw std::runtime_error("unable to close state file");
-#ifdef _WIN32
-        if (!MoveFileExW(temporary_path.c_str(), state_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-          throw std::runtime_error("unable to replace state file");
-        }
-#else
-        fs::rename(temporary_path, state_path);
-#endif
-      }
-      catch (std::exception &e) {
-        BOOST_LOG(error) << "Couldn't write "sv << config::nvhttp.file_state << ": "sv << e.what();
-        return false;
       }
       return true;
     }
 
-    void
+    // Set only after a valid startup read. Corruption must not let a later
+    // pairing replace a repaired/external device list with an empty snapshot.
+    bool pairing_state_loaded = false;
+    nlohmann::json persisted_pairing_root;
+
+    bool
+    save_state(const client_t *snapshot = nullptr) {
+      std::lock_guard mutation_lock { client_mutation_mutex };
+      if (config::sunshine.flags[config::flag::FRESH_STATE]) return true;
+      if (!pairing_state_loaded) return false;
+      client_t current;
+      if (!snapshot) {
+        std::shared_lock lock { client_state_mutex };
+        current = client_root;
+        snapshot = &current;
+      }
+      nlohmann::json committed_root;
+      const auto saved = state_json::transact(state_file_path(), [&](nlohmann::json &document) {
+        if (!valid_pairing_root(document)) return false;
+        auto &root = document["root"];
+        if (root != persisted_pairing_root) return false;
+        if (root.is_null()) root = nlohmann::json::object();
+        const auto unique = root.find("uniqueid");
+        if (unique != root.end() && (!unique->is_string() || unique->get<std::string>() != http::unique_id)) return false;
+        const auto existing = root.find("named_devices");
+        std::map<std::string, nlohmann::json> previous;
+        if (existing != root.end() && *existing != "") {
+          if (!existing->is_array()) return false;
+          for (const auto &entry : *existing) {
+            previous.emplace(entry["uuid"].get<std::string>(), entry);
+          }
+        }
+        auto updated = nlohmann::json::array();
+        for (const auto &device : snapshot->named_devices) {
+          const auto found = previous.find(device.uuid);
+          auto entry = found == previous.end() ? nlohmann::json::object() : found->second;
+          entry["name"] = device.name;
+          entry["cert"] = device.cert;
+          entry["uuid"] = device.uuid;
+          if (entry.contains("enabled") && entry["enabled"].is_boolean()) entry["enabled"] = device.enabled;
+          else entry["enabled"] = device.enabled ? "true" : "false";
+          entry["last_session_ended"] = std::to_string(device.last_session_ended);
+          entry["family"] = client_family::to_string(device.family.family);
+          entry["family_version"] = device.family.version;
+          entry["family_os"] = device.family.os;
+          entry["family_source"] = device.family.source;
+          entry["family_last_seen"] = std::to_string(device.family.last_seen);
+          entry["family_rank"] = std::to_string(device.family.rank);
+          updated.push_back(std::move(entry));
+        }
+        root["uniqueid"] = http::unique_id;
+        root["named_devices"] = std::move(updated);
+        // load_state includes the legacy certificates in this snapshot; retire
+        // the old list to avoid restoring revoked devices on the next start.
+        root.erase("devices");
+        committed_root = root;
+        return true;
+      });
+      if (saved) persisted_pairing_root = std::move(committed_root);
+      return saved;
+    }
+
+    bool
     add_authorized_client(const std::string &name, std::string &&cert, client_family::record_t family) {
       std::lock_guard mutation_lock { client_mutation_mutex };
+      auto parsed_cert = crypto::x509(cert);
+      if (!parsed_cert) return false;
       named_cert_t named_cert;
       named_cert.name = name;
       named_cert.cert = std::move(cert);
       named_cert.uuid = uuid_util::uuid_t::generate().string();
       named_cert.family = std::move(family);
+      client_t candidate;
       {
-        std::unique_lock<std::shared_mutex> ul(client_state_mutex);
-        // A client that pairs again with the certificate it already has is the same device: it keeps its entry and its UUID
-        // (the per-client settings and the session history are keyed by it) and takes the name and family of the new pairing.
-        // Before this, every re-pairing added an entry with the same certificate, which no client could tell apart.
-        const auto same_cert = std::find_if(client_root.named_devices.begin(), client_root.named_devices.end(), [&](const auto &existing) {
-          return existing.cert == named_cert.cert;
-        });
-        if (same_cert != client_root.named_devices.end()) {
-          BOOST_LOG(info) << "Client paired again with its certificate; keeping its entry [client="sv << masked_client_id(same_cert->uuid) << ']';
-          same_cert->name = named_cert.name;
-          if (named_cert.family.family != client_family::family_e::unknown) {
-            same_cert->family = std::move(named_cert.family);
-          }
-        }
-        else {
-          client_root.named_devices.emplace_back(std::move(named_cert));
+        std::shared_lock lock { client_state_mutex };
+        candidate = client_root;
+      }
+      // Re-pairing keeps the same entry, UUID and enabled flag.
+      const auto same_cert = std::find_if(candidate.named_devices.begin(), candidate.named_devices.end(), [&](const auto &existing) {
+        return crypto::x509_matches_pem(parsed_cert.get(), existing.cert);
+      });
+      const bool needs_trust = same_cert == candidate.named_devices.end();
+      if (needs_trust) {
+        candidate.named_devices.emplace_back(std::move(named_cert));
+      }
+      else {
+        if (!same_cert->enabled) return false;
+        same_cert->name = std::move(named_cert.name);
+        if (named_cert.family.family != client_family::family_e::unknown) {
+          same_cert->family = std::move(named_cert.family);
         }
       }
-
-      if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
-        save_state();
-      }
+      if (!save_state(&candidate)) return false;
+      std::unique_lock lock { client_state_mutex };
+      if (needs_trust) cert_chain.add(std::move(parsed_cert));
+      client_root = std::move(candidate);
+      return true;
     }
 
     template <class T>
@@ -467,40 +480,38 @@ namespace nvhttp {
     void
     load_state() {
       std::lock_guard mutation_lock { client_mutation_mutex };
+      if (config::sunshine.flags[config::flag::FRESH_STATE]) return;
+      pairing_state_loaded = false;
+      persisted_pairing_root = nullptr;
       const auto state_path = state_file_path();
       pt::ptree tree;
       try {
-        if (!fs::exists(state_path)) {
-          BOOST_LOG(debug) << "File "sv << config::nvhttp.file_state << " doesn't exist"sv;
-          http::unique_id = uuid_util::uuid_t::generate().string();
-          return;
+        if (fs::exists(state_path)) {
+          std::ifstream input { state_path, std::ios::binary };
+          if (!input) throw std::runtime_error("read");
+          const auto document = nlohmann::json::parse(input, nullptr, false);
+          if (!document.is_object() || input.bad() || !valid_pairing_root(document)) throw std::runtime_error("parse");
+          if (document.contains("root")) persisted_pairing_root = document.at("root");
+          std::istringstream formatted { document.dump() };
+          pt::read_json(formatted, tree);
         }
-        std::ifstream state_file { state_path };
-        if (!state_file.is_open()) {
-          throw std::runtime_error("unable to open state file for reading");
-        }
-        pt::read_json(state_file, tree);
       }
-      catch (std::exception &e) {
-        BOOST_LOG(error) << "Couldn't read "sv << config::nvhttp.file_state << ": "sv << e.what();
+      catch (const std::exception &) {
+        BOOST_LOG(error) << "Could not read pairing state; leaving the original file untouched and using a temporary host ID"sv;
         http::unique_id = uuid_util::uuid_t::generate().string();
         {
           std::unique_lock<std::shared_mutex> ul(client_state_mutex);
           cert_chain.clear();
           client_root = client_t {};
         }
-        save_state(false);
         return;
       }
 
       auto unique_id_p = tree.get_optional<std::string>("root.uniqueid");
-      if (!unique_id_p) {
-        http::unique_id = uuid_util::uuid_t::generate().string();
-        return;
-      }
-      http::unique_id = std::move(*unique_id_p);
+      http::unique_id = unique_id_p ? std::move(*unique_id_p) : uuid_util::uuid_t::generate().string();
 
-      auto root = tree.get_child("root");
+      const pt::ptree empty_root;
+      const auto &root = tree.get_child("root", empty_root);
       client_t client;
 
       if (root.get_child_optional("devices")) {
@@ -512,13 +523,14 @@ namespace nvhttp {
               named_cert.name = ""s;
               named_cert.cert = el.get_value<std::string>();
               named_cert.uuid = uuid_util::uuid_t::generate().string();
-              client.named_devices.emplace_back(named_cert);
+              client.named_devices.emplace_back(std::move(named_cert));
             }
           }
         }
       }
 
       if (root.count("named_devices")) {
+        auto named_begin = client.named_devices.size();
         for (auto &[_, el] : root.get_child("named_devices")) {
           named_cert_t named_cert;
           named_cert.name = el.get_child("name").get_value<std::string>();
@@ -532,7 +544,18 @@ namespace nvhttp {
           named_cert.family.source = el.get<std::string>("family_source", "");
           named_cert.family.last_seen = el.get<std::int64_t>("family_last_seen", 0);
           named_cert.family.rank = el.get<std::uint8_t>("family_rank", 0);
-          client.named_devices.emplace_back(named_cert);
+          // Prefer the named entry (including a disabled entry) over its
+          // legacy certificate so old state cannot revive a denied device.
+          if (auto cert = crypto::x509(named_cert.cert); cert && named_begin != 0) {
+            auto begin = client.named_devices.begin();
+            const auto end = begin + named_begin;
+            const auto duplicates = std::remove_if(begin, end, [&](const auto &legacy) {
+              return crypto::x509_matches_pem(cert.get(), legacy.cert);
+            });
+            named_begin -= static_cast<std::size_t>(end - duplicates);
+            client.named_devices.erase(duplicates, end);
+          }
+          client.named_devices.emplace_back(std::move(named_cert));
         }
       }
 
@@ -540,9 +563,15 @@ namespace nvhttp {
         std::unique_lock<std::shared_mutex> ul(client_state_mutex);
         cert_chain.clear();
         for (auto &named_cert : client.named_devices) {
-          if (named_cert.enabled) cert_chain.add(crypto::x509(named_cert.cert));
+          if (named_cert.enabled) {
+            if (auto cert = crypto::x509(named_cert.cert)) cert_chain.add(std::move(cert));
+          }
         }
         client_root = std::move(client);
+      }
+      pairing_state_loaded = true;
+      if (!unique_id_p && !save_state()) {
+        BOOST_LOG(error) << "Could not persist the generated host ID; this ID is temporary"sv;
       }
     }
 
@@ -751,16 +780,16 @@ namespace nvhttp {
     bool same_hash = hash.size() == sess.clienthash.size() && std::equal(hash.begin(), hash.end(), sess.clienthash.begin());
     auto verify = crypto::verify256(crypto::x509(client.cert), secret, sign);
     if (same_hash && verify) {
-      tree.put("root.paired", 1);
-
-      {
-        std::unique_lock<std::shared_mutex> ul(client_state_mutex);
-        cert_chain.add(crypto::x509(client.cert));
-      }
-
       client.family_observation.now = client_family::unix_now();
       auto family = client_family::merge({}, client.family_observation);
-      add_authorized_client(client.name, std::move(client.cert), std::move(family));
+      if (!add_authorized_client(client.name, std::move(client.cert), std::move(family))) {
+        tree.put("root.paired", 0);
+        tree.put("root.<xmlattr>.status_code", 503);
+        tree.put("root.<xmlattr>.status_message", "Could not persist pairing state");
+        remove_session(sess);
+        return;
+      }
+      tree.put("root.paired", 1);
     }
     else {
       tree.put("root.paired", 0);
@@ -853,9 +882,9 @@ namespace nvhttp {
     tray_state::clear_pairing_required();
   }
 
-  void
+  bool
   add_paired_client_for_test(const std::string &name, std::string cert, client_family::record_t family) {
-    add_authorized_client(name, std::move(cert), std::move(family));
+    return add_authorized_client(name, std::move(cert), std::move(family));
   }
 #endif
 
@@ -936,38 +965,38 @@ namespace nvhttp {
     return last_pair_name;
   }
 
-  void
+  bool
   erase_all_clients() {
     std::lock_guard mutation_lock { client_mutation_mutex };
+    const client_t empty;
+    if (!save_state(&empty)) return false;
     {
       std::unique_lock<std::shared_mutex> ul(client_state_mutex);
       client_root = client_t {};
       cert_chain.clear();
     }
-    save_state();
+    return true;
   }
 
   int
   unpair_client(std::string uuid) {
     std::lock_guard mutation_lock { client_mutation_mutex };
-    bool removed = false;
+    client_t candidate;
     {
-      std::unique_lock<std::shared_mutex> ul(client_state_mutex);
-      auto &devices = client_root.named_devices;
-      for (auto it = devices.begin(); it != devices.end();) {
-        if (it->uuid == uuid) {
-          it = devices.erase(it);
-          removed = true;
-        }
-        else {
-          ++it;
-        }
+      std::shared_lock lock { client_state_mutex };
+      candidate = client_root;
+    }
+    if (!std::erase_if(candidate.named_devices, [&](const auto &device) { return device.uuid == uuid; })) return 0;
+    if (!save_state(&candidate)) return 0;
+    std::unique_lock lock { client_state_mutex };
+    cert_chain.clear();
+    for (const auto &device : candidate.named_devices) {
+      if (device.enabled) {
+        if (auto cert = crypto::x509(device.cert)) cert_chain.add(std::move(cert));
       }
     }
-
-    save_state();
-    pairing::load_state();
-    return removed;
+    client_root = std::move(candidate);
+    return 1;
   }
 
   bool
@@ -989,13 +1018,15 @@ namespace nvhttp {
     const bool previous = found->enabled;
     found->enabled = enabled;
     // Readers must not observe a permission change until it is persisted.
-    if (!config::sunshine.flags[config::flag::FRESH_STATE] && !save_state(true, &client_root)) {
+    if (!config::sunshine.flags[config::flag::FRESH_STATE] && !save_state(&client_root)) {
       found->enabled = previous;
       return false;
     }
     cert_chain.clear();
     for (const auto &client : client_root.named_devices) {
-      if (client.enabled) cert_chain.add(crypto::x509(client.cert));
+      if (client.enabled) {
+        if (auto cert = crypto::x509(client.cert)) cert_chain.add(std::move(cert));
+      }
     }
     return true;
   }
@@ -1003,21 +1034,18 @@ namespace nvhttp {
   bool
   rename_client(const std::string &uuid, const std::string &new_name) {
     std::lock_guard mutation_lock { client_mutation_mutex };
-    bool renamed = false;
+    client_t candidate;
     {
-      std::unique_lock<std::shared_mutex> ul(client_state_mutex);
-      for (auto &named_cert : client_root.named_devices) {
-        if (named_cert.uuid == uuid) {
-          named_cert.name = new_name;
-          renamed = true;
-          break;
-        }
-      }
+      std::shared_lock lock { client_state_mutex };
+      candidate = client_root;
     }
-    if (renamed) {
-      save_state();
-    }
-    return renamed;
+    const auto found = std::find_if(candidate.named_devices.begin(), candidate.named_devices.end(), [&](const auto &device) { return device.uuid == uuid; });
+    if (found == candidate.named_devices.end()) return false;
+    found->name = new_name;
+    if (!save_state(&candidate)) return false;
+    std::unique_lock lock { client_state_mutex };
+    client_root = std::move(candidate);
+    return true;
   }
 
   bool

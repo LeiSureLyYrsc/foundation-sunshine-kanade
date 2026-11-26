@@ -240,7 +240,7 @@ namespace nvhttp {
   void
   reset_pairing_sessions_for_test();
   /// Record a completed pairing without the handshake.
-  void
+  bool
   add_paired_client_for_test(const std::string &name, std::string cert, client_family::record_t family);
 #endif
 
@@ -349,6 +349,6 @@ namespace nvhttp {
    * nvhttp::erase_all_clients();
    * @examples_end
    */
-  void
+  bool
   erase_all_clients();
 }  // namespace nvhttp

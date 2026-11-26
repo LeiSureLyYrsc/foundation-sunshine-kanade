@@ -65,6 +65,25 @@ With disposable test accounts, check these outcomes independently:
   existing service. Check the sidecar mapping and rejection cases for TCP
   `47990` and `48001`; do not disable the Foundation WebUI to get a clean result.
 
+## Native pairing and shared state
+
+Run `session_auth_routes_unit_tests`, `pairing_pending_unit_tests` and the
+native pairing policy tests in Windows Actions before using a candidate.
+The state writer coordinates current Core and `--creds` writers via a
+persistent sibling `.lock` file. A blocked writer fails instead of writing
+without the lock. Do not remove the lock or edit/copy the state while any
+writer is running; older builds and third-party tools do not participate.
+If credentials and state are split, each target retains its own lock and file.
+
+In an approved isolated package, test an account-only state, a state with
+paired devices but no host ID, and a damaged state. Check that successful
+initialization persists the host ID without erasing credentials or devices.
+Check that a complete native handshake, not setting a QR PIN, commits the
+device before reporting it paired. Obstruct one write and verify no new
+device trust is activated; once the file is writable, repeat a real native
+handshake and verify the IDs and trust after an approved restart. Do not use
+test sessions, IDs, credentials or certificates from an active installation.
+
 Verify the two UI surfaces on one candidate package, including disabled or
 missing Kanade, stale status, pending work, and native PIN independently.
 Record separate evidence for control-plane login, cloud authorization, native
