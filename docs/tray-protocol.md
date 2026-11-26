@@ -68,6 +68,16 @@ remain independent of the online integration; opening the companion or the
 independent HTTPS User Center requires a trusted host-provided action. These
 actions never approve a cloud request or submit a native PIN.
 
+Core's in-process `tray_state::set_kanade_status` publishes the typed snapshot
+and capability together through the existing state/SSE serializer. It is not
+an HTTP action, file reader, pipe client or service-discovery hook. Supplying an
+invalid/expired observation or withdrawing the source clears the snapshot,
+bumping the revision and notifying SSE if the state changed. Without a new
+publication, the serialized snapshot retains its original observation time;
+consumers must expire it locally even if the tray remains connected. No
+production caller is wired in the locked build. See
+[the paired tray source handoff](windows/foundation-tray-online-mode.md).
+
 The `owner` field describes the packaged tray strategy (`gui`, `core`, or
 `disabled`). The packaged GUI uses its existing single-instance guard. Version
 1 deliberately does not add a second ownership heartbeat.

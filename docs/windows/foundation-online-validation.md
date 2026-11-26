@@ -108,6 +108,10 @@ client to it or scrape companion output. Until there is a trusted, separate
 read-only status source, the panel cannot assert online mode or display a
 live cloud request count.
 
+The [paired tray source handoff](foundation-tray-online-mode.md) contains
+reviewable patches for both pinned source trees. Their presence in Core does
+not change the GUI selected by the packaging workflow.
+
 Compare `portable-build-inputs.json`, `SHA256SUMS.txt`, and the portable archive
 under the same Actions run and attempt. Record the separate REM-2 Windows
 workflow run, source commit and archive/executable hashes before a runtime

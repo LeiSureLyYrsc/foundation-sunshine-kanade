@@ -1,6 +1,7 @@
 #include "tray_state.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <mutex>
 #include <random>
@@ -21,6 +22,39 @@ namespace tray_state {
     now_ms() {
       const auto now = std::chrono::system_clock::now().time_since_epoch();
       return std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+    }
+
+    constexpr std::int64_t json_max_safe_integer = 9'007'199'254'740'991;
+    constexpr std::int64_t kanade_max_age_ms = 120'000;
+
+    template<class T, std::size_t N>
+    void
+    put_word(nlohmann::json &out, const char *key, std::optional<T> field, const std::array<const char *, N> &words) {
+      if (field && static_cast<std::size_t>(*field) < N) {
+        out[key] = words[static_cast<std::size_t>(*field)];
+      }
+    }
+
+    nlohmann::json
+    kanade_json(const kanade_status_t &state) {
+      nlohmann::json result { { "version", 1 }, { "updated_at_ms", state.updated_at_ms } };
+      put_word(result, "component", state.component, std::array { "available", "disabled", "missing", "incompatible", "unavailable" });
+      put_word(result, "registration", state.registration, std::array { "registered", "unregistered" });
+      put_word(result, "control", state.control, std::array { "online", "offline", "unreachable" });
+      put_word(result, "transport", state.transport, std::array { "standby", "protected" });
+      if (state.pending_count) {
+        result["pending_count"] = *state.pending_count;
+      }
+      if (state.connection_authorized) {
+        result["connection_authorized"] = *state.connection_authorized;
+      }
+      if (state.native_paired) {
+        result["native_paired"] = *state.native_paired;
+      }
+      if (state.streaming) {
+        result["streaming"] = *state.streaming;
+      }
+      return result;
     }
 
     const std::string &
@@ -363,6 +397,29 @@ namespace tray_state {
   }
 
   void
+  set_kanade_status(std::optional<kanade_status_t> status) {
+    if (status) {
+      const auto observed = status->updated_at_ms;
+      const auto now = now_ms();
+      if (observed <= 0 || observed > json_max_safe_integer ||
+          observed < now - kanade_max_age_ms || observed > now + kanade_max_age_ms) {
+        status.reset();
+      } else if (status->pending_count && *status->pending_count > static_cast<std::uint64_t>(json_max_safe_integer)) {
+        status->pending_count.reset();
+      }
+    }
+    {
+      std::lock_guard lock { state_mutex };
+      if (current_state.kanade == status) {
+        return;
+      }
+      current_state.kanade = std::move(status);
+      touch_locked();
+    }
+    notify_changed();
+  }
+
+  void
   set_launch(launch_t launch) {
     {
       std::lock_guard lock { state_mutex };
@@ -442,7 +499,11 @@ namespace tray_state {
     capabilities.push_back("touch-keyboard-v1");
 #endif
 
-    return {
+    if (snapshot.kanade) {
+      capabilities.push_back("kanade-v1");
+    }
+
+    nlohmann::json result = {
       { "protocol_version", protocol_version },
       { "instance_id", instance_id() },
       { "owner", tray_owner() },
@@ -499,6 +560,11 @@ namespace tray_state {
           { "error", snapshot.operation.error },
         } },
     };
+    // Keep the envelope stable for a revision. Readers expire it using the source timestamp.
+    if (snapshot.kanade) {
+      result["kanade"] = kanade_json(*snapshot.kanade);
+    }
+    return result;
   }
 
 }  // namespace tray_state

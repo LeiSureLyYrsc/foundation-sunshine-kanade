@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 
 #include <src/tray/tray_state.h>
 
@@ -19,6 +20,7 @@ protected:
   void
   SetUp() override {
     tray_state::set_change_sink({});
+    tray_state::set_kanade_status(std::nullopt);
     tray_state::clear_sessions();
     tray_state::set_touch_keyboard(std::nullopt);
     tray_state::clear_pairing_required();
@@ -33,8 +35,62 @@ protected:
   void
   TearDown() override {
     tray_state::set_change_sink({});
+    tray_state::set_kanade_status(std::nullopt);
   }
 };
+
+TEST_F(TrayStateTest, NativeSessionsDoNotAdvertiseKanadeStatus) {
+  tray_state::set_streaming("Desktop");
+  tray_state::set_pairing_required("Moonlight Client");
+  tray_state::add_session(42, "Moonlight Client");
+  const auto snapshot = tray_state::to_json();
+  const auto &capabilities = snapshot.at("capabilities");
+  EXPECT_EQ(std::find(capabilities.begin(), capabilities.end(), "kanade-v1"), capabilities.end());
+  EXPECT_FALSE(snapshot.contains("kanade"));
+}
+
+TEST_F(TrayStateTest, KanadePublicationPreservesIndependentEvidenceAndSourceTime) {
+  auto changes = 0;
+  tray_state::set_change_sink([&changes]() { ++changes; });
+  const auto observed = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count() - 1000;
+  tray_state::kanade_status_t status;
+  status.updated_at_ms = observed;
+  status.control = tray_state::kanade_control_e::online;
+  status.transport = tray_state::kanade_transport_e::protected_path;
+  status.pending_count = 0;
+  status.connection_authorized = true;
+  status.native_paired = false;
+  tray_state::set_kanade_status(status);
+  const auto snapshot = tray_state::to_json();
+  const auto &capabilities = snapshot.at("capabilities");
+  EXPECT_NE(std::find(capabilities.begin(), capabilities.end(), "kanade-v1"), capabilities.end());
+  EXPECT_EQ(snapshot.at("kanade"), (nlohmann::json {
+    { "version", 1 }, { "updated_at_ms", observed }, { "control", "online" }, { "transport", "protected" },
+    { "pending_count", 0 }, { "connection_authorized", true }, { "native_paired", false }
+  }));
+  tray_state::set_kanade_status(status);
+  EXPECT_EQ(tray_state::to_json().at("revision"), snapshot.at("revision"));
+  EXPECT_EQ(changes, 1);
+
+  status.pending_count = 9'007'199'254'740'992ULL;
+  tray_state::set_kanade_status(status);
+  EXPECT_FALSE(tray_state::to_json().at("kanade").contains("pending_count"));
+  EXPECT_EQ(tray_state::to_json().at("kanade").at("updated_at_ms"), observed);
+
+  status.updated_at_ms = observed - 120'001;
+  tray_state::set_kanade_status(status);
+  EXPECT_FALSE(tray_state::to_json().contains("kanade"));
+  status.updated_at_ms = observed;
+  tray_state::set_kanade_status(status);
+  tray_state::set_kanade_status(std::nullopt);
+  const auto withdrawn = tray_state::to_json();
+  const auto &withdrawn_caps = withdrawn.at("capabilities");
+  EXPECT_EQ(std::find(withdrawn_caps.begin(), withdrawn_caps.end(), "kanade-v1"), withdrawn_caps.end());
+  EXPECT_FALSE(withdrawn.contains("kanade"));
+  EXPECT_EQ(changes, 5);
+  tray_state::set_change_sink({});
+}
 
 TEST_F(TrayStateTest, PublishesAndClearsTouchKeyboardPreference) {
   const auto before = tray_state::get().revision;
