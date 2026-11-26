@@ -532,6 +532,35 @@ TEST_F(SessionAuthRoutes, LocalTokenRotationInvalidatesThePreviousValue) {
 }
 
 #ifdef _WIN32
+TEST_F(SessionAuthRoutes, LocalTokenReplacementConflictFailsClosedThenRepublishes) {
+  const auto previous = local_token();
+  ASSERT_EQ(previous.size(), 64u);
+  const auto path = directory / "local-auth.token";
+  HANDLE blocker = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  ASSERT_NE(blocker, INVALID_HANDLE_VALUE);
+  const auto close = util::fail_guard([&] { if (blocker != INVALID_HANDLE_VALUE) CloseHandle(blocker); });
+
+  EXPECT_FALSE(confighttp::local_auth_token::initialize());
+  EXPECT_FALSE(confighttp::local_auth_token::matches(previous));
+  EXPECT_TRUE(local_token() == previous);
+
+  auto client = connect();
+  const auto stale = client->request("GET", "/api/test-local-auth-required", "",
+    { { "X-Sunshine-Local-Token", previous } });
+  EXPECT_EQ(stale->status_code, "401 Unauthorized");
+
+  ASSERT_TRUE(CloseHandle(blocker));
+  blocker = INVALID_HANDLE_VALUE;
+  ASSERT_TRUE(confighttp::local_auth_token::initialize());
+  const auto current = local_token();
+  EXPECT_TRUE(current != previous);
+  const auto accepted = client->request("GET", "/api/test-local-auth-required", "",
+    { { "X-Sunshine-Local-Token", current } });
+  EXPECT_EQ(accepted->status_code, "200 OK");
+  EXPECT_FALSE(confighttp::local_auth_token::matches(previous));
+}
+
 TEST_F(SessionAuthRoutes, LocalTokenRecoversAfterIdentityQueryFailure) {
   local_auth_test_as_system.store(true);
   const auto reset = util::fail_guard([] {

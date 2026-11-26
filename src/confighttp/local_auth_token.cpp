@@ -38,6 +38,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -54,6 +55,12 @@ namespace confighttp::local_auth_token {
     std::string current_token;
 
 #ifdef _WIN32
+    constexpr auto rotation_retry_delay = std::chrono::seconds(30);
+    void
+    log_win32_failure(const char *file_kind, const char *stage, DWORD code) {
+      BOOST_LOG(error) << "Could not publish " << file_kind << ": stage=" << stage << " win32_error=" << code;
+    }
+
     struct user_identity_t {
       bool system = false;
       std::vector<BYTE> sid;
@@ -64,6 +71,7 @@ namespace confighttp::local_auth_token {
     bool monitor_stop = false;
     std::thread monitor_thread;
     user_identity_t current_identity;
+    std::chrono::steady_clock::time_point next_rotation_attempt;
 #endif
 
     std::filesystem::path
@@ -104,13 +112,22 @@ namespace confighttp::local_auth_token {
     };
 
     bool
-    make_well_known_sid(WELL_KNOWN_SID_TYPE type, std::vector<BYTE> &storage, PSID &sid) {
+    make_well_known_sid(WELL_KNOWN_SID_TYPE type, std::vector<BYTE> &storage, PSID &sid, const char *file_kind) {
       DWORD size = 0;
       CreateWellKnownSid(type, nullptr, nullptr, &size);
-      if (size == 0 || GetLastError() != ERROR_INSUFFICIENT_BUFFER) return false;
+      const auto size_error = GetLastError();
+      if (size == 0 || size_error != ERROR_INSUFFICIENT_BUFFER) {
+        log_win32_failure(file_kind, "CreateWellKnownSid(size)", size_error);
+        return false;
+      }
       storage.resize(size);
       sid = storage.data();
-      return CreateWellKnownSid(type, nullptr, sid, &size) != FALSE;
+      if (!CreateWellKnownSid(type, nullptr, sid, &size)) {
+        const auto error = GetLastError();
+        log_win32_failure(file_kind, "CreateWellKnownSid", error);
+        return false;
+      }
+      return true;
     }
 
     bool
@@ -154,11 +171,11 @@ namespace confighttp::local_auth_token {
     }
 
     bool
-    make_security_material(security_material_t &material, const user_identity_t &identity) {
-      if (!make_well_known_sid(WinLocalSystemSid, material.system_sid_storage, material.system_sid) ||
+    make_security_material(security_material_t &material, const user_identity_t &identity, const char *file_kind) {
+      if (!make_well_known_sid(WinLocalSystemSid, material.system_sid_storage, material.system_sid, file_kind) ||
           !make_well_known_sid(WinBuiltinAdministratorsSid,
             material.administrators_sid_storage,
-            material.administrators_sid)) {
+            material.administrators_sid, file_kind)) {
         return false;
       }
       if (!identity.sid.empty()) {
@@ -182,28 +199,66 @@ namespace confighttp::local_auth_token {
         add_entry(material.user_sid, GENERIC_READ);
       }
 
-      if (SetEntriesInAclW(static_cast<ULONG>(entries.size()), entries.data(), nullptr, &material.acl) != ERROR_SUCCESS) {
+      const auto acl_error = SetEntriesInAclW(static_cast<ULONG>(entries.size()), entries.data(), nullptr, &material.acl);
+      if (acl_error != ERROR_SUCCESS) {
+        log_win32_failure(file_kind, "SetEntriesInAclW", acl_error);
         return false;
       }
 
       material.descriptor = LocalAlloc(LPTR, SECURITY_DESCRIPTOR_MIN_LENGTH);
-      if (!material.descriptor ||
-          !InitializeSecurityDescriptor(material.descriptor, SECURITY_DESCRIPTOR_REVISION) ||
-          !SetSecurityDescriptorDacl(material.descriptor, TRUE, material.acl, FALSE)) {
+      if (!material.descriptor) {
+        const auto error = GetLastError();
+        log_win32_failure(file_kind, "LocalAlloc(security descriptor)", error);
+        return false;
+      }
+      if (!InitializeSecurityDescriptor(material.descriptor, SECURITY_DESCRIPTOR_REVISION)) {
+        const auto error = GetLastError();
+        log_win32_failure(file_kind, "InitializeSecurityDescriptor", error);
+        return false;
+      }
+      if (!SetSecurityDescriptorDacl(material.descriptor, TRUE, material.acl, FALSE)) {
+        const auto error = GetLastError();
+        log_win32_failure(file_kind, "SetSecurityDescriptorDacl", error);
         return false;
       }
 
       if (!SetSecurityDescriptorControl(material.descriptor, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
+        const auto error = GetLastError();
+        log_win32_failure(file_kind, "SetSecurityDescriptorControl", error);
         return false;
       }
       return true;
     }
 
     bool
-    write_token_file(const std::filesystem::path &path, const std::string &token, const user_identity_t &identity) {
+    has_administrators_owner(const std::filesystem::path &path, PSID administrators) {
+      // Diagnostic only: this handle is not evidence of an authorized migration.
+      // Do not follow a final reparse point or read the old credential.
+      const auto handle = CreateFileW(path.c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+      if (handle == INVALID_HANDLE_VALUE) return false;
+      const auto close = util::fail_guard([&] { CloseHandle(handle); });
+      BY_HANDLE_FILE_INFORMATION info {};
+      if (!GetFileInformationByHandle(handle, &info) || info.nNumberOfLinks != 1 ||
+          (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY))) return false;
+      PSID owner = nullptr;
+      PSECURITY_DESCRIPTOR descriptor = nullptr;
+      const auto result = GetSecurityInfo(handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+        &owner, nullptr, nullptr, nullptr, &descriptor);
+      const auto release = util::fail_guard([&] { if (descriptor) LocalFree(descriptor); });
+      return result == ERROR_SUCCESS && owner && EqualSid(owner, administrators);
+    }
+
+    bool
+    write_token_file(const std::filesystem::path &path, std::string_view token, const user_identity_t &identity, bool local_token = false) {
+      const auto file_kind = local_token ? "local Web UI token" : "restricted Web UI file";
       security_material_t material;
-      if (!make_security_material(material, identity)) {
-        BOOST_LOG(error) << "Could not create local Web UI token security descriptor";
+      if (!make_security_material(material, identity, file_kind)) {
+        return false;
+      }
+      if (token.size() > (std::numeric_limits<DWORD>::max)()) {
+        log_win32_failure(file_kind, "WriteFile(size)", ERROR_FILE_TOO_LARGE);
         return false;
       }
 
@@ -221,24 +276,44 @@ namespace confighttp::local_auth_token {
         FILE_ATTRIBUTE_NORMAL,
         nullptr);
       if (handle == INVALID_HANDLE_VALUE) {
+        const auto error = GetLastError();
+        log_win32_failure(file_kind, "CreateFileW(temp)", error);
         return false;
       }
 
       DWORD written = 0;
-      const auto write_ok = WriteFile(handle,
-                              token.data(),
-                              static_cast<DWORD>(token.size()),
-                              &written,
-                              nullptr) &&
-                            written == token.size() &&
-                            FlushFileBuffers(handle);
-      CloseHandle(handle);
-      if (!write_ok ||
-          !MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        DeleteFileW(temporary.c_str());
-        return false;
+      bool ok = false;
+      if (!WriteFile(handle, token.data(), static_cast<DWORD>(token.size()), &written, nullptr)) {
+        const auto error = GetLastError();
+        log_win32_failure(file_kind, "WriteFile", error);
+      } else if (written != token.size()) {
+        // A successful short write has no meaningful GetLastError value.
+        BOOST_LOG(error) << "Could not publish " << file_kind << ": stage=WriteFile reason=short_write";
+      } else if (!FlushFileBuffers(handle)) {
+        const auto error = GetLastError();
+        log_win32_failure(file_kind, "FlushFileBuffers", error);
+      } else {
+        ok = true;
       }
-      return true;
+      if (!CloseHandle(handle)) {
+        const auto error = GetLastError();
+        log_win32_failure(file_kind, "CloseHandle(temp)", error);
+        ok = false;
+      }
+      if (ok) {
+        if (MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
+        const auto error = GetLastError();
+        log_win32_failure(file_kind, "MoveFileExW", error);
+        if (local_token && error == ERROR_ACCESS_DENIED && has_administrators_owner(path, material.administrators_sid)) {
+          BOOST_LOG(warning) << "Local Web UI token publication blocked: possible administrator-owned leftover; "
+                             << "use approved installation maintenance to verify the exact target. Previous token remains disabled.";
+        }
+      }
+      if (!DeleteFileW(temporary.c_str())) {
+        const auto error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND) log_win32_failure(file_kind, "DeleteFileW(temp)", error);
+      }
+      return false;
     }
 #else
     bool
@@ -294,7 +369,11 @@ namespace confighttp::local_auth_token {
       const auto path = token_path();
       std::error_code directory_error;
       std::filesystem::create_directories(path.parent_path(), directory_error);
-      if (directory_error || !write_token_file(path, token, identity)) return false;
+      if (directory_error) {
+        log_win32_failure("local Web UI token", "create_directories", directory_error.value());
+        return false;
+      }
+      if (!write_token_file(path, token, identity, true)) return false;
       current_identity = identity;
       current_token = token;
       return true;
@@ -315,8 +394,13 @@ namespace confighttp::local_auth_token {
         return;
       }
       current_token.clear();
+      const auto now = std::chrono::steady_clock::now();
+      if (now < next_rotation_attempt) return;
       if (!rotate_token_locked(identity)) {
+        next_rotation_attempt = now + rotation_retry_delay;
         BOOST_LOG(error) << "Could not rotate the local Web UI token after the interactive user changed";
+      } else {
+        next_rotation_attempt = {};
       }
     }
   }  // namespace
@@ -344,13 +428,13 @@ namespace confighttp::local_auth_token {
     const auto path = token_path();
     std::error_code directory_error;
     std::filesystem::create_directories(path.parent_path(), directory_error);
-    if (directory_error ||
 #ifdef _WIN32
-        !write_token_file(path, token, identity)
+    if (directory_error) log_win32_failure("local Web UI token", "create_directories", directory_error.value());
+    const bool published = !directory_error && write_token_file(path, token, identity, true);
 #else
-        !write_token_file(path, token)
+    const bool published = !directory_error && write_token_file(path, token);
 #endif
-    ) {
+    if (!published) {
       current_token.clear();
       BOOST_LOG(error) << "Could not publish the local Web UI token file";
       return false;
@@ -359,6 +443,7 @@ namespace confighttp::local_auth_token {
     current_token = token;
 #ifdef _WIN32
     current_identity = std::move(identity);
+    next_rotation_attempt = {};
 #endif
     return true;
   }
@@ -369,7 +454,7 @@ namespace confighttp::local_auth_token {
 #ifdef _WIN32
     user_identity_t identity;
     if (!query_user_identity(identity)) return false;
-    return write_token_file(path, std::string { contents }, identity);
+    return write_token_file(path, contents, identity);
 #else
     return write_token_file(path, std::string { contents });
 #endif
