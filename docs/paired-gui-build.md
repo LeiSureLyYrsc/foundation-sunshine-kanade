@@ -13,8 +13,12 @@ must be a successful Panel `build.yml` run at the committed
 plugin together and writes `paired-build.json` with the repository, run and
 commit used. The two bundle sources are mutually exclusive in that workflow;
 a missing or mismatched paired artifact fails the run instead of falling back
-to the release bundle. The download credential must be able to read Actions
-artifacts from the Panel repository.
+to the release bundle. Only those manual download steps read the
+`PANEL_READ_TOKEN` Actions secret, which must be separately provisioned with
+read access to the Panel repository's Actions artifacts. The current paired
+fetch and gitlink both refer to `AlkaidLab/foundation-panel`; a fork needs an
+explicit reviewed source change in both places, not merely a different run ID.
+If building the Panel by manual dispatch, set `create_release=false`.
 
 For local paired staging, run `scripts/fetch-paired-gui.ps1 -Destination <fresh-path>`
 from the Sunshine checkout. Omit `RunId` to discover a matching build, or pass

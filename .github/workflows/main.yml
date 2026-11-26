@@ -521,6 +521,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           FORCED: ${{ inputs.sharded_cold }}
+          GUI_RUN_ID: ${{ inputs.gui_run_id }}
           DEFAULT_REF: refs/heads/${{ github.event.repository.default_branch }}
           THIS_REF: ${{ github.ref }}
           FINGERPRINT: ${{ steps.fingerprint.outputs.fingerprint }}
@@ -535,6 +536,9 @@ jobs:
             # The cold-shard claim protocol creates remote refs. Keep
             # isolated online-mode validation on the single Windows runner.
             reason="artifact-only development branch"
+          elif [[ "$EVENT" == workflow_dispatch && -n "$GUI_RUN_ID" ]]; then
+            # Shard jobs don't consume a cross-repository Panel credential.
+            reason="paired GUI artifact"
           elif [[ "$EVENT" == schedule ]]; then
             sharded=true; reason="nightly build"
           elif [[ "$FORCED" == true ]]; then
@@ -740,7 +744,6 @@ jobs:
     if: needs.changes.outputs.build == 'true'
     permissions:
       contents: read
-      actions: read
     runs-on: windows-latest
     steps:
       - name: Keep LF line endings
@@ -784,10 +787,11 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.gui_run_id != ''
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PANEL_READ_TOKEN }}
           GUI_RUN_ID: ${{ inputs.gui_run_id }}
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
+          if (-not $env:GH_TOKEN) { throw 'Paired GUI artifact needs a read-only Panel Actions credential' }
           $dest = "$env:RUNNER_TEMP/paired-gui"
           ./scripts/fetch-paired-gui.ps1 -RunId $env:GUI_RUN_ID -Destination $dest
           "GUI_BUNDLE_DIR=$dest" >> $env:GITHUB_ENV
@@ -1075,10 +1079,11 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.gui_run_id != ''
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PANEL_READ_TOKEN }}
           GUI_RUN_ID: ${{ inputs.gui_run_id }}
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
+          if (-not $env:GH_TOKEN) { throw 'Paired GUI artifact needs a read-only Panel Actions credential' }
           $dest = "$env:RUNNER_TEMP/paired-gui"
           ./scripts/fetch-paired-gui.ps1 -RunId $env:GUI_RUN_ID -Destination $dest
           "GUI_BUNDLE_DIR=$dest" >> $env:GITHUB_ENV
