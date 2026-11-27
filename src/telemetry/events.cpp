@@ -4,16 +4,17 @@
  */
 #include "events.h"
 #include "error_report.h"
+#include "log_template.h"
 #include "stream_health.h"
 
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <cctype>
+#include <cmath>
 #include <functional>
 #include <map>
-#include <set>
 #include <regex>
+#include <set>
 
 using json = nlohmann::json;
 using namespace std::literals;
@@ -25,11 +26,8 @@ namespace telemetry {
 
   std::string_view
   kind_name(kind_e kind) {
-    switch (kind) {
-      case kind_e::usage: return "usage"sv;
-      case kind_e::error: return "error"sv;
-      case kind_e::experience: return "experience"sv;
-    }
+    if (kind == kind_e::error) return "error"sv;
+    if (kind == kind_e::experience) return "experience"sv;
     return "usage"sv;
   }
 
@@ -118,7 +116,10 @@ namespace telemetry {
       std::size_t chars = 0, i = 0;
       while (i < text.size()) {
         const auto lead = static_cast<unsigned char>(text[i]);
-        const std::size_t len = lead < 0x80 ? 1 : (lead >> 5) == 0x6 ? 2 : (lead >> 4) == 0xe ? 3 : (lead >> 3) == 0x1e ? 4 : 1;
+        const std::size_t len = lead < 0x80 ? 1 : (lead >> 5) == 0x6 ? 2 :
+                                                (lead >> 4) == 0xe   ? 3 :
+                                                (lead >> 3) == 0x1e  ? 4 :
+                                                                       1;
         if (chars == max_chars) return text.substr(0, i);
         i += std::min(len, text.size() - i);
         ++chars;
@@ -372,6 +373,7 @@ namespace telemetry {
       attachment,
       log_ref,
       shot_ref,
+      reply_key,
       text,
       contact,
       histograms,
@@ -380,6 +382,7 @@ namespace telemetry {
       crumbs,
       log_lines,
       frame,
+      site,
       vector8 };  // exactly 8 non-negative integers: the fixed buckets of a page sketch
 
     struct prop_spec_t {
@@ -490,7 +493,7 @@ namespace telemetry {
                                                 { "severity", type_e::choice, 0, 0, severity_choices },
                                                 { "count", type_e::integer, 1, 1000000 },
                                                 { "build", type_e::catalogue, 0, 40 },
-                                                // no message: a line of the log or a text a page caught can carry what a person chose (a device, a game, a path). The code names the error; the one place for typed text is user_report.
+                                                { "site", type_e::site },  // basename and line only
                                               } });
         // what the person wrote in the error dialog (spec "Worker additions"): a category, the component and page as tokens, an error code, the reference of an uploaded attachment and one scrubbed message of at most 2000 characters, the screenshot's reference and the word for why it is missing; the contact when the person left one
         t.push_back({ kind_e::error, "user_report", {
@@ -505,6 +508,7 @@ namespace telemetry {
                                                       { "shot_state", type_e::choice, 0, 0, shot_state_choices },
                                                       { "message", type_e::text, 0, static_cast<double>(MAX_USER_REPORT_CHARS), {}, true },
                                                       { "contact", type_e::contact, 0, static_cast<double>(MAX_USER_CONTACT_CHARS) },
+                                                      { "reply_key", type_e::reply_key },
                                                     } });
         // a fault of the virtual display driver that Windows Error Reporting wrote to the Application log: that it happened, which module, the exception code and the offset (wer_event.h); no stack exists
         t.push_back({ kind_e::error, "wer_event", {
@@ -554,6 +558,7 @@ namespace telemetry {
             { "submitted", type_e::integer, 0, 100000000 },
             { "queue_flushes", type_e::integer, 0, 1000000 },
             { "queue_frames_dropped", type_e::integer, 0, 100000000 },
+            { "send_would_block_packets", type_e::integer, 0, 1000000000 },
             { "idr_requests", type_e::integer, 0, 1000000 },
             { "rfi_requests", type_e::integer, 0, 1000000 },
             { "anomalies", type_e::integer, 0, 1000000 },
@@ -744,7 +749,6 @@ namespace telemetry {
       }();
       return table;
     }
-
     // -> the cleaned value, or nullopt when the value does not fit the spec
     std::optional<json>
     clean(const prop_spec_t &spec, const json &value) {
@@ -811,6 +815,13 @@ namespace telemetry {
           const auto text = value.get<std::string>();
           return std::regex_match(text, ref) ? std::optional<json> { json(text) } : std::nullopt;
         }
+        case type_e::reply_key: {
+          // the address of the developers' answer to this report: made at random by the page (rk_ and 128 bits), kept by the page on its own computer and written by the server only into the issue of this report
+          if (!value.is_string()) return std::nullopt;
+          static const std::regex ref(R"(^rk_[0-9a-f]{32}$)");
+          const auto text = value.get<std::string>();
+          return std::regex_match(text, ref) ? std::optional<json> { json(text) } : std::nullopt;
+        }
         case type_e::text: {
           if (!value.is_string()) return std::nullopt;
           return json(scrub_text(value.get<std::string>(), static_cast<std::size_t>(spec.max)));
@@ -832,6 +843,8 @@ namespace telemetry {
           line = cut_utf8(line, static_cast<std::size_t>(spec.max));
           return line.empty() ? std::nullopt : std::optional<json> { json(line) };
         }
+        case type_e::site:
+          return value.is_string() && valid_log_site(value.get_ref<const std::string &>()) ? std::optional<json> { value } : std::nullopt;
         case type_e::frame: {
           if (!value.is_string()) return std::nullopt;
           auto frame = clean_frame(value.get<std::string>());
@@ -1190,14 +1203,6 @@ namespace telemetry {
       flush();
     }
     return out;
-  }
-
-  bool
-  high_volume_event(std::string_view name) {
-    static const std::array<std::string_view, 11> names {
-      "app_start", "app_exit", "feature_used", "setting_changed", "stream_start", "stream_end", "stream_quality", "startup", "panel_page", "page_vitals", "api_latency",
-    };
-    return std::find(names.begin(), names.end(), name) != names.end();
   }
 
   std::vector<event_t>

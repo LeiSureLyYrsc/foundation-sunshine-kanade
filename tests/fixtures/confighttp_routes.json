@@ -229,6 +229,10 @@
     "method": "POST"
   },
   {
+    "pattern": "^/api/apps/cover-preview$",
+    "method": "GET"
+  },
+  {
     "pattern": "^/api/clients/unpair-all$",
     "method": "POST"
   },
@@ -527,14 +531,6 @@
   {
     "pattern": "^/api/audio/devices$",
     "method": "GET"
-  },
-  {
-    "pattern": "^/api/audio/vb-cable/enable$",
-    "method": "POST"
-  },
-  {
-    "pattern": "^/api/audio/vb-cable/install$",
-    "method": "POST"
   },
   {
     "pattern": "^/api/runtime/audio$",

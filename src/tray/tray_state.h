@@ -116,6 +116,9 @@ namespace tray_state {
   state_t
   get();
 
+  bool
+  has_sessions();
+
   void
   set_change_sink(change_sink_t sink);
 

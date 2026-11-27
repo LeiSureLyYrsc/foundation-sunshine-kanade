@@ -51,6 +51,8 @@ extern "C" {
 #include "spatial_transport/mat_live_session.h"
 #include "src/log_text.h"
 #include "stream.h"
+#include "streaming/client_framerate.h"
+#include "streaming/expected_failures.h"
 #include "streaming/fec.h"
 #include "sync.h"
 #include "text_context/bridge.h"
@@ -777,6 +779,12 @@ namespace rtsp_stream {
 
     void
     handle_accept(const boost::system::error_code &ec) {
+      if (streaming::accept_was_cancelled(ec)) {
+        // stop() closes the acceptor, which cancels the pending accept: this is the normal shutdown, not a failure
+        BOOST_LOG(debug) << "RTSP accept cancelled: "sv << ec.message();
+        return;
+      }
+
       if (ec) {
         BOOST_LOG(error) << "Couldn't accept incoming connections: "sv << ec.message();
 
@@ -1346,11 +1354,13 @@ namespace rtsp_stream {
 
 #ifdef _WIN32
     // Clients that do not advertise CAPABILITY_PYROWAVE ignore this Windows
-    // extension and negotiate one of the legacy formats below. Do not
-    // advertise it if this host cannot create the Vulkan runtime device; that
-    // lets clients fall back before ANNOUNCE instead of failing on the first
-    // encoded frame.
-    if (pyrowave::is_server_runtime_available()) {
+    // extension and negotiate one of the legacy formats below. The advertisement
+    // is optimistic: the client's capability is not visible until ANNOUNCE, so
+    // the runtime probe runs (in its own process, once) only when a client
+    // actually selects the format there. A host whose probe fails stops
+    // advertising for the rest of the process, and the client falls back to a
+    // legacy format on its next connection.
+    if (pyrowave::may_advertise()) {
       // Select PyroWave only through the versioned x-ss-pyrowave contract.
       // Do not put its out-of-range numeric ID in the legacy bitStreamFormat
       // attribute, which older clients may parse.
@@ -1891,6 +1901,11 @@ namespace rtsp_stream {
       monitor.width = getArg("x-nv-video[0].clientViewportWd"sv);
       BOOST_LOG(info) << "Client requested stream resolution (clientViewport): " << monitor.width << "x" << monitor.height;
       monitor.framerate = getArg("x-nv-video[0].maxFPS"sv);
+      if (const auto usable = streaming::usable_client_framerate(monitor.framerate); usable != monitor.framerate) {
+        // the capture pacing divides by this rate: a client that announces 0 would crash the host at its first frame
+        BOOST_LOG(warning) << "Client announced an unusable frame rate ("sv << monitor.framerate << "), streaming at "sv << usable << " fps"sv;
+        monitor.framerate = usable;
+      }
       monitor.bitrate = getArg("x-nv-vqos[0].bw.maximumBitrateKbps"sv);
       monitor.slicesPerFrame = getArg("x-nv-video[0].videoEncoderSlicesPerFrame"sv);
       monitor.numRefFrames = getArg("x-nv-video[0].maxNumReferenceFrames"sv);
@@ -2040,6 +2055,7 @@ namespace rtsp_stream {
         monitor.pre_encode_filter = platf::pre_encode_filter_e::external_neural_enhancement;
         monitor.enhancement_backend = session.dlssnr_backend;
       }
+      monitor.nr_app_allowed = session.dlssnr_params.enabled;
       auto &nr_config = monitor.pre_encode_filter_config;
       nr_config.nr_scale_percent = session.dlssnr_scale_percent;
       nr_config.nr_intensity = session.dlssnr_params.intensity;
@@ -2072,25 +2088,15 @@ namespace rtsp_stream {
 
       int clientRefreshRateX100 = getArg("x-nv-video[0].clientRefreshRateX100"sv);
 
-      // Only use clientRefreshRateX100 if it's within 2% of maxFPS
-      bool useClientRefreshRate = false;
-      if (clientRefreshRateX100 > 0 && monitor.framerate > 0) {
-        double ratio = (clientRefreshRateX100 / 100.0) / monitor.framerate;
-        useClientRefreshRate = (ratio > 0.98 && ratio < 1.02);
-      }
+      // The fractional refresh (the client's display rate times 100) may only refine the effective rate,
+      // never exceed it: the fallback and the cap that replaced an unusable maxFPS bind this path too,
+      // or capture pacing and the encoder would run above the rate the announcement allows.
+      const auto frame_rate = streaming::effective_frame_rate(clientRefreshRateX100, monitor.framerate);
+      monitor.frameRateNum = frame_rate.num;
+      monitor.frameRateDen = frame_rate.den;
 
-      if (useClientRefreshRate) {
-        int remainder = clientRefreshRateX100 % 100;
-        monitor.frameRateNum = (remainder == 0) ? clientRefreshRateX100 / 100 : clientRefreshRateX100;
-        monitor.frameRateDen = (remainder == 0) ? 1 : 100;
-
-        BOOST_LOG(info) << "Client framerate: " << clientRefreshRateX100 / 100.0 << " fps ("
-                        << monitor.frameRateNum << "/" << monitor.frameRateDen << ")";
-      }
-      else {
-        monitor.frameRateNum = monitor.framerate;
-        monitor.frameRateDen = 1;
-      }
+      BOOST_LOG(info) << "Client framerate: " << monitor.get_effective_framerate() << " fps ("
+                      << monitor.frameRateNum << "/" << monitor.frameRateDen << ")";
 
       configuredBitrateKbps = getArg("x-ml-video.configuredBitrateKbps"sv);
 

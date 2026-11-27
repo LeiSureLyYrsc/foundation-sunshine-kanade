@@ -219,7 +219,6 @@ namespace nvhttp {
     }
     if (const auto defaults = image_enhancement::load_nr_defaults()) {
       const auto &f = defaults->filter;
-      launch_session->dlssnr_params.enabled = defaults->enabled;
       launch_session->dlssnr_params.intensity = f.nr_intensity;
       launch_session->dlssnr_params.style = f.nr_style;
       launch_session->dlssnr_params.skin_structure_strength = f.nr_skin_structure_strength;
@@ -228,15 +227,11 @@ namespace nvhttp {
       launch_session->dlssnr_params.motion_quality = f.nr_motion_quality;
       launch_session->dlssnr_scale_percent = f.nr_scale_percent;
     }
-    // Explicit per-app on/off settings take precedence; inherit uses the saved
-    // stream defaults. The overlay processing scale is currently global.
-    if (const auto app_dlssnr = proc::proc.get_app_dlssnr_config(launch_session->appid)) {
-      launch_session->dlssnr_params = *app_dlssnr;
-    }
+    const auto app_nr = proc::proc.get_app_dlssnr_config(launch_session->appid);
+    if (app_nr) launch_session->dlssnr_params = *app_nr;
+    // App Off opts out. Both Auto and On require the global switch, including on resume.
+    launch_session->dlssnr_params.enabled = !app_nr || app_nr->enabled;
     if (launch_session->dlssnr_params.enabled) {
-      // Reserve both enabled backends until RTSP knows the final wire format.
-      // It selects RTX HDR only for PQ and releases the unused backend;
-      // HLG/SDR must retain NR even when launch initially requested RTX HDR.
       launch_session->dlssnr_backend = image_enhancement::manager().acquire_selected(image_enhancement::backend_capability_e::nr);
     }
     launch_session->use_vdd = util::from_view(get_arg(args, "useVdd", "0"));
@@ -908,6 +903,11 @@ namespace nvhttp {
     }
     if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
+    }
+    // Resume requests need not include an appid. Resolve per-app enhancement
+    // settings against the running app rather than treating it as Auto.
+    if (args.find("appid"s) == std::end(args)) {
+      args.emplace("appid", std::to_string(current_appid));
     }
     const auto launch_session = make_launch_session(host_audio, args);
     if (!launch_session) {

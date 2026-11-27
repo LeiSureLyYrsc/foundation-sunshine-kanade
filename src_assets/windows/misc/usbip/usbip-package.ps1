@@ -10,6 +10,12 @@ param(
   [int]$SimulateHubProblem = 0
 )
 Set-StrictMode -Version Latest
+# The Panel and the registered uninstaller can launch this script directly,
+# bypassing install-usbip.bat. Windows PowerShell needs .EXE in PATHEXT for
+# native commands in a pipeline, including the guard and pnputil.
+if (($env:PATHEXT -split ';') -notcontains '.EXE') {
+  $env:PATHEXT = '.EXE;' + $env:PATHEXT
+}
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'usbip-package-functions.psm1') -Force -DisableNameChecking
 if (-not $Payload) { $Payload = Join-Path $PSScriptRoot 'usbip' }
@@ -34,7 +40,7 @@ if ($Action -ne 'verify' -and $ownership.ownership -eq 'external') {
     [pscustomobject]@{ ownership = 'external'; compatible = $ownership.compatible; reason = $ownership.reason; ready = $ready; replaceable = $ownership.replaceable; version = $ownership.version } | ConvertTo-Json -Compress
     exit 0
   }
-  Write-Output 'USB/IP is externally managed; no changes were made.'
+  Write-Output "USB/IP is externally managed; no changes were made. reason=$($ownership.reason)"
   if ($Action -eq 'install' -and -not $ownership.compatible) { exit 106 }
   exit 0
 }
@@ -82,7 +88,7 @@ try {
   $ownership = Get-UsbipOwnership $InstallRoot $HostRoot -ConfirmedReplace:$confirmed
   if ($confirmed -and $ownership.ownership -ne 'legacy-owned') { Write-Output 'USB/IP cannot be replaced from here; no changes were made.'; $rc = 107; exit 107 }
   if ($ownership.ownership -eq 'external') {
-    Write-Output 'USB/IP is externally managed; no changes were made.'
+    Write-Output "USB/IP is externally managed; no changes were made. reason=$($ownership.reason)"
     if ($Action -eq 'install' -and -not $ownership.compatible) { $rc = 106; exit 106 }
     $rc = 0; exit 0
   }
