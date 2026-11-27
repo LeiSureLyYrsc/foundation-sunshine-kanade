@@ -1620,14 +1620,21 @@ jobs:
         shell: pwsh
         env:
           CORE_RELEASE_TAG: ${{ needs.setup_release.outputs.release_tag }}
+          GUI_RUN_ID: ${{ inputs.gui_run_id }}
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           $portable = @(Get-ChildItem -LiteralPath artifacts -Filter 'Sunshine.*.Portable-x64.zip' -File)
           if ($portable.Count -ne 1) { throw 'Expected exactly one Windows x64 portable archive' }
           $panel = (Get-Content -LiteralPath scripts/installer-inputs.json -Raw | ConvertFrom-Json).gui
           $paired = Join-Path $env:GUI_BUNDLE_DIR 'paired-build.json'
-          if (Test-Path -LiteralPath $paired -PathType Leaf) {
+          if ($env:GUI_RUN_ID) {
+            if (-not (Test-Path -LiteralPath $paired -PathType Leaf)) { throw 'Missing paired GUI provenance' }
             $panel = Get-Content -LiteralPath $paired -Raw | ConvertFrom-Json
+            $gitlink = git rev-parse 'HEAD:src_assets/common/sunshine-control-panel'
+            if ($panel.repository -cne 'LeiSureLyYrsc/foundation-panel-kanade' -or
+                $panel.run_id -cne $env:GUI_RUN_ID -or $panel.commit -cne $gitlink) {
+              throw 'Paired GUI provenance does not match the selected run and committed Panel gitlink'
+            }
           }
           $hashes = [ordered]@{}
           foreach ($name in @('sunshine-gui.exe', 'alkaidlab-plugin-stylus.dll')) {
