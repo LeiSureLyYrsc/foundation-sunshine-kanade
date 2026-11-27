@@ -97,6 +97,7 @@ import { hostData } from '../composables/hostData.js'
 import { apiFetch, apiJson } from '../utils/apiFetch.js'
 import { hasOpened, lazyPane } from '../utils/lazyPane.js'
 import { createFramedBack } from '../utils/framedBack.js'
+import { kanadeOnlineTexts } from '../utils/kanadeOnlineMode.js'
 
 const { t, te, locale: uiLocale } = useI18n()
 // While the page is open the server can stop answering: the content area then shows the offline state with the countdown (a dead server cannot be restarted from
@@ -123,6 +124,7 @@ const MAnnouncementPage = lazy(() => import('foundation-ui/vue/MAnnouncementPage
 const VIEWS = {
   home: lazy(() => import('./Home.vue')),
   pin: lazy(() => import('./Pin.vue')),
+  'online-mode': lazy(() => import('./OnlineMode.vue')),
   apps: lazy(() => import('./Apps.vue')),
   config: lazy(() => import('./Config.vue')),
   downloads: lazy(() => import('./Downloads.vue')),
@@ -185,6 +187,7 @@ const SUPPORTING = {}
 const PAGES = {
   home: { rail: 'overview', path: '/', list: false },
   pin: { rail: 'stream', path: '/pin', icon: 'devices', tone: 'tertiary', label: 'navbar.clients' },
+  'online-mode': { rail: 'stream', path: null, hash: 'online-mode', icon: 'public', tone: 'primary', text: (locale) => kanadeOnlineTexts(locale).panel.title },
   apps: { rail: 'stream', path: '/apps', icon: 'apps', tone: 'secondary', label: 'navbar.applications' },
   downloads: { rail: 'stream', path: '/downloads', icon: 'download', tone: 'success', label: 'resource_card.client_downloads' },
   config: { rail: 'config', path: '/config', icon: 'tune', tone: 'primary', label: 'navbar.configuration' },

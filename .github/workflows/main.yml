@@ -554,6 +554,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           FORCED: ${{ inputs.sharded_cold }}
+          GUI_RUN_ID: ${{ inputs.gui_run_id }}
           DEFAULT_REF: refs/heads/${{ github.event.repository.default_branch }}
           THIS_REF: ${{ github.ref }}
           FINGERPRINT: ${{ steps.fingerprint.outputs.fingerprint }}
@@ -564,7 +565,14 @@ jobs:
           set -euo pipefail
           sharded=false
           reason=""
-          if [[ "$EVENT" == schedule ]]; then
+          if [[ "$EVENT" == workflow_dispatch && "$THIS_REF" == refs/heads/kanade/foundation-online-ui-* ]]; then
+            # The cold-shard claim protocol creates remote refs. Keep
+            # isolated online-mode validation on the single Windows runner.
+            reason="artifact-only development branch"
+          elif [[ "$EVENT" == workflow_dispatch && -n "$GUI_RUN_ID" ]]; then
+            # Shard jobs don't consume a cross-repository Panel credential.
+            reason="paired GUI artifact"
+          elif [[ "$EVENT" == schedule ]]; then
             sharded=true; reason="nightly build"
           elif [[ "$FORCED" == true ]]; then
             sharded=true; reason="requested"
@@ -895,12 +903,26 @@ jobs:
             ccache-windows-
 
       - name: Fetch pinned installer inputs
+        if: github.event_name != 'workflow_dispatch' || inputs.gui_run_id == ''
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           $dest = "$env:RUNNER_TEMP/installer-inputs/pinned"
           ./scripts/fetch-installer-inputs.ps1 -Destination $dest
           "GUI_BUNDLE_DIR=$dest/gui" >> $env:GITHUB_ENV
+
+      - name: Fetch paired GUI artifact
+        if: github.event_name == 'workflow_dispatch' && inputs.gui_run_id != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.PANEL_READ_TOKEN }}
+          GUI_RUN_ID: ${{ inputs.gui_run_id }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          if (-not $env:GH_TOKEN) { throw 'Paired GUI artifact needs a read-only Panel Actions credential' }
+          $dest = "$env:RUNNER_TEMP/paired-gui"
+          ./scripts/fetch-paired-gui.ps1 -RunId $env:GUI_RUN_ID -Destination $dest
+          "GUI_BUNDLE_DIR=$dest" >> $env:GITHUB_ENV
 
       - name: Test the adapter build configuration without the SDK
         shell: msys2 {0}
@@ -1179,9 +1201,10 @@ jobs:
             echo "::warning title=A compile shard failed::this job compiles the objects that no shard cache has"
           fi
 
-      # The Panel bundle, pinned by tag/sha256 in scripts/installer-inputs.json and verified (never
-      # "latest"). The pinned Panel commit must be the committed submodule. A manual run with gui_run_id replaces the GUI below.
+      # Use one verified input: the release pin (never "latest") or a manual
+      # artifact at the committed Panel gitlink. No release is required for the latter.
       - name: Fetch pinned installer inputs
+        if: github.event_name != 'workflow_dispatch' || inputs.gui_run_id == ''
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
@@ -1193,13 +1216,14 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.gui_run_id != ''
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PANEL_READ_TOKEN }}
           GUI_RUN_ID: ${{ inputs.gui_run_id }}
         run: |
-          $arguments = @{ Destination = "$env:RUNNER_TEMP/paired-gui" }
-          if ($env:GUI_RUN_ID) { $arguments.RunId = $env:GUI_RUN_ID }
-          ./scripts/fetch-paired-gui.ps1 @arguments
-          "GUI_BUNDLE_DIR=$env:RUNNER_TEMP/paired-gui" >> $env:GITHUB_ENV
+          $PSNativeCommandUseErrorActionPreference = $true
+          if (-not $env:GH_TOKEN) { throw 'Paired GUI artifact needs a read-only Panel Actions credential' }
+          $dest = "$env:RUNNER_TEMP/paired-gui"
+          ./scripts/fetch-paired-gui.ps1 -RunId $env:GUI_RUN_ID -Destination $dest
+          "GUI_BUNDLE_DIR=$dest" >> $env:GITHUB_ENV
 
       - name: Configure Windows
         id: configure_windows
@@ -1245,10 +1269,8 @@ jobs:
           # (string(TIMESTAMP) honours SOURCE_DATE_EPOCH; CMake documentation, command/string), and a header
           # whose bytes differ from the shards' invalidates every cache entry that reads it.
           export SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct)"
-          gui_options=()
-          if [[ -n "${GUI_BUNDLE_DIR:-}" ]]; then
-            gui_options=(-DFETCH_GUI=OFF "-DGUI_DIR=$GUI_BUNDLE_DIR")
-          fi
+          : "${GUI_BUNDLE_DIR:?A verified Panel bundle is required for the Windows build}"
+          gui_options=(-DFETCH_GUI=OFF "-DGUI_DIR=$GUI_BUNDLE_DIR")
           compiler=(-DSUNSHINE_PRECOMPILED_HEADERS=ON)
           if [[ "$TOOLCHAIN" == clang ]]; then
             compiler=(-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld -DSUNSHINE_PRECOMPILED_HEADERS=ON)
@@ -1637,6 +1659,14 @@ jobs:
           cmake -E chdir portable-check cmake -E tar xf ../cpack_artifacts/Sunshine.zip
           python3 ../tools/pe_symbols.py --check --recursive portable-check
           cmake -E tar tf ./cpack_artifacts/Sunshine.zip | tr '\\' '/' > portable-files.txt
+          # CMake does not build the WebUI in this job: the earlier, pinned npm
+          # build must still reach the archive alongside the verified GUI bundle.
+          for required in Sunshine/assets/web/index.html Sunshine/assets/gui/sunshine-gui.exe Sunshine/assets/gui/alkaidlab-plugin-stylus.dll; do
+            if ! grep -Fxq "$required" portable-files.txt; then
+              echo "Portable archive is missing $required"
+              exit 1
+            fi
+          done
           if [[ "$RTX_VIDEO_ADAPTER_BUILT" == "true" ]]; then
             grep -F "Sunshine/tools/hdr_enhanced/nvidia_rtx_video/foundation_rtx_video_adapter.dll" portable-files.txt
           fi
@@ -1826,6 +1856,46 @@ jobs:
           # Generate SHA256 checksums from the final release asset names.
           .\scripts\generate-checksums.ps1 -Path .\artifacts -Output "SHA256SUMS.txt"
 
+      - name: Record portable build inputs
+        if: needs.changes.outputs.package == 'true'
+        shell: pwsh
+        env:
+          CORE_RELEASE_TAG: ${{ needs.setup_release.outputs.release_tag }}
+          GUI_RUN_ID: ${{ inputs.gui_run_id }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $portable = @(Get-ChildItem -LiteralPath artifacts -Filter 'Sunshine.*.Portable-x64.zip' -File)
+          if ($portable.Count -ne 1) { throw 'Expected exactly one Windows x64 portable archive' }
+          $panel = (Get-Content -LiteralPath scripts/installer-inputs.json -Raw | ConvertFrom-Json).gui
+          $paired = Join-Path $env:GUI_BUNDLE_DIR 'paired-build.json'
+          if ($env:GUI_RUN_ID) {
+            if (-not (Test-Path -LiteralPath $paired -PathType Leaf)) { throw 'Missing paired GUI provenance' }
+            $panel = Get-Content -LiteralPath $paired -Raw | ConvertFrom-Json
+            $gitlink = git rev-parse 'HEAD:src_assets/common/sunshine-control-panel'
+            if ($panel.repository -cne 'LeiSureLyYrsc/foundation-panel-kanade' -or
+                $panel.run_id -cne $env:GUI_RUN_ID -or $panel.commit -cne $gitlink) {
+              throw 'Paired GUI provenance does not match the selected run and committed Panel gitlink'
+            }
+          }
+          $hashes = [ordered]@{}
+          foreach ($name in @('sunshine-gui.exe', 'alkaidlab-plugin-stylus.dll')) {
+            $hashes[$name] = (Get-FileHash -LiteralPath (Join-Path $env:GUI_BUNDLE_DIR $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          [ordered]@{
+            workflow_run = $env:GITHUB_RUN_ID
+            workflow_attempt = $env:GITHUB_RUN_ATTEMPT
+            workflow_repository = $env:GITHUB_REPOSITORY
+            core_commit = (git rev-parse HEAD).Trim()
+            core_version = "$($env:CORE_RELEASE_TAG).杂鱼"
+            webui_foundation_ui_commit = (Get-Content -LiteralPath scripts/ci/foundation-ui.sha -Raw).Trim()
+            submodule_gitlinks = @(git ls-files --stage | Where-Object { $_ -like '160000 *' })
+            panel = $panel
+            gui_version = (Get-Item -LiteralPath (Join-Path $env:GUI_BUNDLE_DIR 'sunshine-gui.exe')).VersionInfo.ProductVersion
+            panel_input_sha256 = $hashes
+            portable_sha256 = (Get-FileHash -LiteralPath $portable[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            sidecar = 'not packaged; verify the separate REM-2 input before runtime validation'
+          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath artifacts/portable-build-inputs.json -Encoding utf8
+
       - name: Upload Artifacts
         if: needs.changes.outputs.package == 'true'
         uses: actions/upload-artifact@v7
@@ -1837,6 +1907,7 @@ jobs:
             artifacts/Sunshine.*.Symbols-x64.zip
             artifacts/SHA256SUMS.txt
             artifacts/checksums.json
+            artifacts/portable-build-inputs.json
           if-no-files-found: error
 
       # A pre-release is deleted, with its assets, once two newer ones exist (LizardByte/create-release-action keeps the latest two), and builds come

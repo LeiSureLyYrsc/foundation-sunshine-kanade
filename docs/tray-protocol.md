@@ -38,6 +38,46 @@ endpoint is the compatibility fallback.
 - `vdd`: virtual-display state and actions
 - `shutdown`: graceful Core and service-wrapper shutdown
 
+### Optional Kanade online-mode contract
+
+`kanade-v1` reserves an additive capability on the existing authenticated
+state and SSE envelopes. It requires a `kanade` object with `version: 1`
+and `updated_at_ms` (UTC epoch milliseconds, a positive JSON safe integer).
+Consumers must not display state when the capability is absent, the version
+does not match, or the source is more than two minutes old. Setting a fresh
+response timestamp must never make stale source data appear fresh. A Core
+without a trusted status source does not advertise the capability.
+
+| Optional field | Allowed values / meaning |
+| --- | --- |
+| `component` | `available`, `disabled`, `missing`, `incompatible`, `unavailable` |
+| `registration` | `registered`, `unregistered` |
+| `control` | `online`, `offline`, `unreachable` |
+| `pending_count` | Non-negative JSON safe integer; never a list or an ID |
+| `transport` | `standby`, `protected` |
+| `connection_authorized` | Boolean for the particular Kanade connection |
+| `native_paired` | Boolean for that same connection's independently proven native pairing |
+| `streaming` | Boolean for that same connection's independently observed stream |
+
+Missing or unrecognized field values are unknown. Registration, a live
+control plane, authorization, native pairing and streaming are independent.
+Do not correlate cloud requests with native requests by name, identifier or
+timing. Do not export private REM-2 IPC data, credentials, URLs, commands,
+request IDs or device identifiers in this object. Refresh and native PIN
+remain independent of the online integration; opening the companion or the
+independent HTTPS User Center requires a trusted host-provided action. These
+actions never approve a cloud request or submit a native PIN.
+
+Core's in-process `tray_state::set_kanade_status` publishes the typed snapshot
+and capability together through the existing state/SSE serializer. It is not
+an HTTP action, file reader, pipe client or service-discovery hook. Supplying an
+invalid/expired observation or withdrawing the source clears the snapshot,
+bumping the revision and notifying SSE if the state changed. Without a new
+publication, the serialized snapshot retains its original observation time;
+consumers must expire it locally even if the tray remains connected. No
+production caller is wired in the locked build. See
+[the paired tray source handoff](windows/foundation-tray-online-mode.md).
+
 The `owner` field describes the packaged tray strategy (`gui`, `core`, or
 `disabled`). The packaged GUI uses its existing single-instance guard. Version
 1 deliberately does not add a second ownership heartbeat.

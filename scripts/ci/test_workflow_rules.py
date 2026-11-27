@@ -174,6 +174,37 @@ class ShardTest(unittest.TestCase):
     def test_the_build_job_waits_for_the_shards(self):
         self.assertIn("shard", self.jobs["build_win"]["needs"])
 
+    def test_isolated_online_ui_dispatch_cannot_create_shard_claims(self):
+        plan = step(self.jobs["cold_plan"], "Decide")["run"]
+        isolated = '"$EVENT" == workflow_dispatch && "$THIS_REF" == refs/heads/kanade/foundation-online-ui-*'
+        self.assertLess(plan.index(isolated), plan.index('"$FORCED" == true'))
+        self.assertLess(plan.index('"$EVENT" == workflow_dispatch && -n "$GUI_RUN_ID"'), plan.index('"$FORCED" == true'))
+
+    def test_only_explicit_pairing_steps_can_receive_the_panel_read_credential(self):
+        import json
+        allowed = {"adapter_config", "build_win"}
+        holders = set()
+        for job, value in self.jobs.items():
+            for item in value.get("steps", []):
+                if "PANEL_READ_TOKEN" in json.dumps(item):
+                    self.assertIn(job, allowed)
+                    self.assertEqual(item["name"], "Fetch paired GUI artifact")
+                    self.assertEqual(item["if"], "github.event_name == 'workflow_dispatch' && inputs.gui_run_id != ''")
+                    self.assertEqual(item["env"]["GH_TOKEN"], "${{ secrets.PANEL_READ_TOKEN }}")
+                    self.assertIn("if (-not $env:GH_TOKEN)", item["run"])
+                    holders.add(job)
+        self.assertEqual(holders, allowed)
+
+    def test_portable_package_checks_both_ui_entries_and_uploads_provenance(self):
+        build = self.jobs["build_win"]
+        names = [item.get("name") for item in build["steps"]]
+        self.assertLess(names.index("Build Web UI"), names.index("Package Windows"))
+        package = step(build, "Package Windows")["run"]
+        for item in ("web/index.html", "gui/sunshine-gui.exe", "gui/alkaidlab-plugin-stylus.dll"):
+            self.assertIn(f"Sunshine/assets/{item}", package)
+        self.assertIn('if ! grep -Fxq "$required" portable-files.txt;', package)
+        self.assertIn("artifacts/portable-build-inputs.json", step(build, "Upload Artifacts")["with"]["path"])
+
     def test_the_shards_configure_like_the_build_job_apart_from_what_only_orders_the_objects(self):
         shard = step(self.jobs["shard"], "Configure Windows")
         build = step(self.jobs["build_win"], "Configure Windows")

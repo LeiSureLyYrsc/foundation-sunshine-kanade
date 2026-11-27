@@ -1,0 +1,639 @@
+diff --git a/src-tauri/src/ctx_popup.rs b/src-tauri/src/ctx_popup.rs
+index fa6de64..f8f329e 100644
+--- a/src-tauri/src/ctx_popup.rs
++++ b/src-tauri/src/ctx_popup.rs
+@@ -485,7 +485,7 @@ pub async fn open_tray(app: AppHandle, variant: crate::tray_prefs::Variant, menu
+ 
+ /// The tray menu on screen (if any) has this token: an item was chosen; the window closes. Returns whether the token was the open menu's.
+ pub fn pick_tray(app: &AppHandle, token: u64) -> bool {
+-    if state().as_ref().is_some_and(|o| o.token == token && o.tray.is_some()) {
++    if is_current_tray_popup(token) {
+         finish(app, None, Reason::Pick);
+         return true;
+     }
+@@ -505,6 +505,10 @@ pub fn tray_menu_open() -> bool {
+     state().as_ref().is_some_and(|o| o.tray.is_some())
+ }
+ 
++pub(crate) fn is_current_tray_popup(token: u64) -> bool {
++    state().as_ref().is_some_and(|o| o.token == token && o.tray.is_some())
++}
++
+ /// The page drew the menu (or drew another level of it) and measured it: size and place the window, show it.
+ #[tauri::command]
+ pub async fn ctx_popup_ready(app: AppHandle, token: u64, width: f64, height: f64) -> Result<(), String> {
+diff --git a/src-tauri/src/main.rs b/src-tauri/src/main.rs
+index f9e206a..26fb4ef 100644
+--- a/src-tauri/src/main.rs
++++ b/src-tauri/src/main.rs
+@@ -462,6 +462,7 @@ fn main() {
+             tray::tray_prefs_get,
+             tray::tray_prefs_set,
+             tray::tray_popup_act,
++            tray::tray_popup_refresh_online_mode,
+             tray::tray_popup_set,
+             tray::tray_layout_set,
+             tray::tray_popup_layout,
+diff --git a/src-tauri/src/sunshine.rs b/src-tauri/src/sunshine.rs
+index 678c770..ef44d70 100644
+--- a/src-tauri/src/sunshine.rs
++++ b/src-tauri/src/sunshine.rs
+@@ -584,6 +584,8 @@ pub struct TrayState {
+     pub owner: String,
+     #[serde(default)]
+     pub capabilities: Vec<String>,
++    #[serde(default, deserialize_with = "read_tray_kanade")]
++    pub kanade: Option<serde_json::Value>,
+     #[serde(default)]
+     pub status: String,
+     #[serde(default)]
+@@ -612,6 +614,53 @@ pub struct TrayState {
+     pub launch: TrayLaunchState,
+ }
+ 
++impl TrayState {
++    pub(crate) fn online_mode(&self) -> serde_json::Value {
++        let advertised = self.capabilities.iter().any(|value| value == "kanade-v1");
++        serde_json::json!({
++            "capabilities": if advertised { &["kanade-v1"][..] } else { &[][..] },
++            "kanade": self.kanade,
++        })
++    }
++}
++
++// Strip everything except the v1 primitives before the popup can receive it. A malformed
++// optional field must not break the tray protocol, native PIN or any other tray feature.
++fn read_tray_kanade<'de, D: serde::Deserializer<'de>>(
++    deserializer: D,
++) -> Result<Option<serde_json::Value>, D::Error> {
++    use serde_json::{Map, Value};
++    let Some(raw) = Option::<Value>::deserialize(deserializer)? else {
++        return Ok(None);
++    };
++    let mut fields = Map::new();
++    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
++    if raw.get("version") == Some(&serde_json::json!(1)) {
++        fields.insert("version".into(), Value::from(1));
++        for key in ["updated_at_ms", "pending_count"] {
++            if let Some(n) = raw.get(key).and_then(Value::as_u64).filter(|&n| n <= MAX_SAFE_INTEGER) {
++                fields.insert(key.into(), Value::from(n));
++            }
++        }
++        for (key, allowed) in [
++            ("component", &["available", "disabled", "missing", "incompatible", "unavailable"][..]),
++            ("registration", &["registered", "unregistered"][..]),
++            ("control", &["online", "offline", "unreachable"][..]),
++            ("transport", &["standby", "protected"][..]),
++        ] {
++            if let Some(word) = raw.get(key).and_then(Value::as_str).filter(|v| allowed.contains(v)) {
++                fields.insert(key.into(), Value::from(word));
++            }
++        }
++        for key in ["connection_authorized", "native_paired", "streaming"] {
++            if let Some(value) = raw.get(key).and_then(Value::as_bool) {
++                fields.insert(key.into(), Value::from(value));
++            }
++        }
++    }
++    Ok(Some(Value::Object(fields)))
++}
++
+ /// The launch splash the host asks for (`launch` in the tray state, capability `launch-splash-v1`). It is handled on its own path (launch_splash.rs), so two
+ /// tray states that differ only here count as equal: a stage line must not rebuild the tray menu.
+ fn launch_display_ready_default() -> bool {
+@@ -713,7 +762,7 @@ fn validate_tray_state(state: &TrayState) -> Result<(), String> {
+ 
+ pub(crate) fn parse_tray_state_json(response_text: &str) -> Result<TrayState, String> {
+     let state: TrayState = serde_json::from_str(response_text)
+-        .map_err(|e| format!("Parse tray state failed: {}; body: {}", e, response_text))?;
++        .map_err(|_| "Parse tray state failed: invalid JSON or field type".to_string())?;
+     validate_tray_state(&state)?;
+     Ok(state)
+ }
+@@ -722,6 +771,21 @@ pub(crate) fn parse_tray_state_json(response_text: &str) -> Result<TrayState, St
+ mod tray_protocol_tests {
+     use super::*;
+ 
++    #[test]
++    fn online_mode_does_not_forward_unknown_data_or_break_the_tray() {
++        let fixture = |optional: &str| {
++            parse_tray_state_json(&format!(
++                r#"{{"protocol_version":{TRAY_PROTOCOL_VERSION},"instance_id":"core","owner":"gui","capabilities":["state-v1","kanade-v1"]{optional}}}"#
++            )).unwrap().online_mode()
++        };
++        assert_eq!(fixture("")["kanade"], serde_json::Value::Null);
++        for raw in ["false", "[]", r#"{"version":2,"control":"online"}"#] {
++            assert_eq!(fixture(&format!(r#","kanade":{raw}"#))["kanade"], serde_json::json!({}));
++        }
++        let result = fixture(r#","kanade":{"version":1,"updated_at_ms":1764153600123,"pending_count":2,"control":"online","native_paired":false,"connection_authorized":"true","streaming":[],"component":"custom","request_id":"ignored"}"#);
++        assert_eq!(result, serde_json::json!({"capabilities":["kanade-v1"],"kanade":{"version":1,"updated_at_ms":1764153600123u64,"pending_count":2,"control":"online","native_paired":false}}));
++    }
++
+     fn valid_state() -> TrayState {
+         TrayState {
+             protocol_version: TRAY_PROTOCOL_VERSION,
+@@ -1147,18 +1211,15 @@ async fn request_tray_state(tray_state_url: &str) -> Result<TrayState, String> {
+         .map_err(|e| format!("Request tray state failed: {}", e))?;
+ 
+     let status = response.status();
++    if !status.is_success() {
++        return Err(format!("Tray state request failed (status {status})"));
++    }
++
+     let response_text = response
+         .text()
+         .await
+         .map_err(|e| format!("Read tray state response failed: {}", e))?;
+ 
+-    if !status.is_success() {
+-        return Err(format!(
+-            "Tray state request failed (status {}): {}",
+-            status, response_text
+-        ));
+-    }
+-
+     parse_tray_state_json(&response_text)
+ }
+ 
+diff --git a/src-tauri/src/tray.rs b/src-tauri/src/tray.rs
+index be2f07a..85294f1 100644
+--- a/src-tauri/src/tray.rs
++++ b/src-tauri/src/tray.rs
+@@ -1445,13 +1445,37 @@ pub async fn tray_popup_layout(app: AppHandle, token: u64, tiles: Option<Vec<Str
+ /// Async on purpose: a synchronous command runs on the main thread inside the page's own WebView2 callback, and the big screen (made on demand) built its WebView there and never came back
+ /// (the whole panel stopped). The item runs on a worker thread, as the in-app 大屏 button does.
+ #[tauri::command]
+-pub async fn tray_popup_act(app: AppHandle, token: u64, id: String) {
++pub async fn tray_popup_act(app: AppHandle, window: tauri::WebviewWindow, token: u64, id: String) {
++    if id == "online_native_pin" {
++        if window.label() == crate::ctx_popup::POPUP_LABEL {
++            let handle = app.clone();
++            let _ = app.run_on_main_thread(move || {
++                if crate::ctx_popup::pick_tray(&handle, token) {
++                    actions::open_pairing_window(&handle);
++                }
++            });
++        }
++        return;
++    }
+     let ran = tauri::async_runtime::spawn_blocking(move || popup_input::act(&app, token, &id)).await;
+     if let Err(error) = ran {
+         error!("tray: the chosen item did not run: {error}");
+     }
+ }
+ 
++/// Read through the existing authenticated local tray client, never the selected remote host.
++#[tauri::command]
++pub async fn tray_popup_refresh_online_mode(window: tauri::WebviewWindow, token: u64) -> Result<serde_json::Value, String> {
++    if window.label() != crate::ctx_popup::POPUP_LABEL || !crate::ctx_popup::is_current_tray_popup(token) {
++        return Err("No active tray popup".into());
++    }
++    let state = sunshine::get_tray_state().await.map_err(|_| "Online mode state unavailable".to_string())?;
++    if !crate::ctx_popup::is_current_tray_popup(token) {
++        return Err("No active tray popup".into());
++    }
++    Ok(state.online_mode())
++}
++
+ /// A slider of the tray's quick page was released (key: resolution | refresh | dpi | bitrate): the menu stays open; resolves when the value is set, rejects with the reason. What it resolves with is a notice
+ /// for the page: null, or for the scale `{ requested, applied, clamped: true, max }` when the display does not allow the step without signing out and the highest one it allows was set.
+ #[tauri::command]
+diff --git a/src-tauri/src/tray/popup_input.rs b/src-tauri/src/tray/popup_input.rs
+index 8da77c6..b4a34bb 100644
+--- a/src-tauri/src/tray/popup_input.rs
++++ b/src-tauri/src/tray/popup_input.rs
+@@ -353,8 +353,15 @@ pub(super) async fn build_state(app: &AppHandle) -> Value {
+     let (auto_start, user_mode) = (false, false);
+ 
+     let prefs = tray_prefs::current();
++    // Read the projection at emit time rather than retaining a snapshot across the awaits above.
++    let online_mode = {
++        let runtime = TRAY_RUNTIME_STATE.lock().unwrap_or_else(|p| p.into_inner());
++        let (state, connection, _) = runtime.menu_snapshot();
++        state.filter(|_| connection == CoreConnectionState::Connected).map(|state| state.online_mode())
++    };
+     json!({
+         "locale": locale,
++        "online_mode": online_mode,
+         "connection": match connection { CoreConnectionState::Connected => "connected", CoreConnectionState::Connecting => "connecting", CoreConnectionState::Disconnected => "disconnected" },
+         "host": tray_state.as_ref().map(|state| host_word(&state.status)).unwrap_or("idle"),
+         "rtss": crate::rtss::is_rtss_installed(),
+diff --git a/src/renderer/composables/menuPopupTransport.js b/src/renderer/composables/menuPopupTransport.js
+index ae13e3b..8330e6d 100644
+--- a/src/renderer/composables/menuPopupTransport.js
++++ b/src/renderer/composables/menuPopupTransport.js
+@@ -25,6 +25,7 @@ export function trayTransport({ invoke, listen }) {
+     onClose: (cb) => listen('ctx-popup:close', (event) => cb(event.payload)),
+     ready: (token, size) => quiet(invoke('ctx_popup_ready', { token, width: size.w, height: size.h })),
+     act: (token, id) => quiet(invoke('tray_popup_act', { token, id })),
++    refreshOnlineMode: (token) => invoke('tray_popup_refresh_online_mode', { token }),
+     // a slider was released: unlike the others this one's answer matters (the page shows the busy state and the failure), so the rejection is not swallowed
+     set: (token, key, value) => invoke('tray_popup_set', { token, key, value }),
+     // the quick panel was edited (the pencil): the record { tiles, sliders } (null = the default); the host stores it and sends the state back
+diff --git a/src/renderer/composables/trayWiring.test.js b/src/renderer/composables/trayWiring.test.js
+index d9e489c..8940e98 100644
+--- a/src/renderer/composables/trayWiring.test.js
++++ b/src/renderer/composables/trayWiring.test.js
+@@ -55,7 +55,8 @@ test('the commands and events: both sides name the same ones, and main.rs regist
+ 
+ test('the menu window page shows both menus; the tray page does not tell the host the window loaded twice', () => {
+   const main = read('src/renderer/ctxmenu/main.js')
+-  assert.match(main, /MMenuPopup, MTrayPopup/); assert.match(main, /h\(MTrayPopup, \{ transport: tray \}\)/)
++  assert.match(main, /MMenuPopup, MTrayPopup/); assert.match(main, /h\(MTrayPopup, \{ transport: tray \}, \{/)
++  assert.match(main, /'start-page': \(\{ state, token \}\) => h\(TrayOnlineMode/)
+   assert.match(read('src/renderer/composables/menuPopupTransport.js'), /loaded: \(\) => \{\}/)
+ })
+ 
+diff --git a/src/renderer/ctxmenu/TrayOnlineMode.vue b/src/renderer/ctxmenu/TrayOnlineMode.vue
+new file mode 100644
+index 0000000..606025c
+--- /dev/null
++++ b/src/renderer/ctxmenu/TrayOnlineMode.vue
+@@ -0,0 +1,87 @@
++<script setup>
++import { computed, onUnmounted, ref, watch } from 'vue'
++import { createTrayOnlineMode } from './trayOnlineMode.js'
++import {
++  kanadeOnlineActions, kanadeOnlineRows, onlineModeRowText, onlineModeText,
++} from './kanadeOnlineMode.js'
++
++const props = defineProps({ state: Object, token: Number, transport: Object })
++const expanded = ref(false)
++const current = ref(null)
++const busy = ref(false)
++const mode = createTrayOnlineMode({
++  read: () => props.transport.refreshOnlineMode(props.token),
++  publish: (snapshot, pending) => { current.value = snapshot; busy.value = pending },
++})
++watch(() => props.state?.online_mode ?? null, (snapshot) => mode.receiveMonitor(snapshot), { immediate: true })
++onUnmounted(mode.dispose)
++
++const text = (key) => onlineModeText(props.state?.locale, key)
++const rows = computed(() => kanadeOnlineRows(current.value))
++const rowText = (row) => onlineModeRowText(props.state?.locale, row)
++// Neither of these external programs has a trusted opener in the locked package.
++const actions = computed(() => kanadeOnlineActions({ state: current.value, busy: busy.value }))
++
++function act(id) {
++  if (!actions.value.find((action) => action.id === id)?.enabled) return
++  if (id === 'refresh') void mode.refresh()
++  else if (id === 'native_pin') props.transport.act(props.token, 'online_native_pin')
++}
++function toggle() {
++  expanded.value = !expanded.value
++  if (expanded.value) mode.checkAge()
++}
++</script>
++
++<template>
++  <section class="tray-online">
++    <button class="tray-online__trigger" type="button" :aria-expanded="expanded" aria-controls="tray-online-details" @click="toggle">
++      {{ text('panel.title') }}
++      <span aria-hidden="true">{{ expanded ? '−' : '+' }}</span>
++    </button>
++    <div v-show="expanded" id="tray-online-details" class="tray-online__details">
++      <p>{{ text('panel.description') }}</p>
++      <p v-if="rows[0].id === 'presence'" role="status">{{ rowText(rows[0]) }} {{ text('note.absence') }}</p>
++      <dl v-else aria-live="polite">
++        <div v-for="row in rows" :key="row.id">
++          <dt>{{ text(`field.${row.id}`) }}</dt>
++          <dd>{{ rowText(row) }}</dd>
++        </div>
++      </dl>
++      <p v-if="rows[0].id !== 'presence'">{{ text('note.per_connection') }}</p>
++      <div class="tray-online__actions">
++        <div v-for="action in actions" :key="action.id">
++          <button type="button" :disabled="!action.enabled" :aria-describedby="action.reason ? `tray-online-reason-${action.id}` : undefined" @click="act(action.id)">
++            {{ text(`action.${action.id}`) }}
++          </button>
++          <small v-if="action.reason" :id="`tray-online-reason-${action.id}`">{{ text(`action_reason.${action.reason}`) }}</small>
++        </div>
++      </div>
++    </div>
++  </section>
++</template>
++
++<style scoped>
++.tray-online { margin-block-end: .45rem; }
++.tray-online__trigger, .tray-online__actions button {
++  color: var(--md-sys-color-on-secondary-container);
++  background: var(--md-sys-color-secondary-container);
++  border: 0;
++  border-radius: .65rem;
++  font: inherit;
++  cursor: pointer;
++  min-height: 2rem;
++  padding: .3rem .65rem;
++}
++.tray-online__trigger { display: flex; align-items: center; justify-content: space-between; width: 100%; text-align: start; }
++:global(.m-tray.is-touch) .tray-online button { min-height: 2.75rem; }
++.tray-online button:focus-visible { outline: 2px solid var(--md-sys-color-primary); outline-offset: 1px; }
++.tray-online__details { padding: .35rem .45rem; color: var(--md-sys-color-on-surface); font-size: .85rem; overflow-wrap: anywhere; }
++.tray-online__details p, .tray-online__details dl { margin: .35rem 0; }
++.tray-online__details dl > div { display: flex; gap: .5rem; justify-content: space-between; padding: .2rem 0; border-bottom: 1px solid var(--md-sys-color-outline-variant); }
++.tray-online__details dd { margin: 0; text-align: end; }
++.tray-online__actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .3rem; }
++.tray-online__actions button { width: 100%; }
++.tray-online__actions button:disabled { color: var(--md-sys-color-on-surface-variant); background: transparent; cursor: default; }
++.tray-online__actions small { display: block; color: var(--md-sys-color-on-surface-variant); line-height: 1.25; }
++</style>
+diff --git a/src/renderer/ctxmenu/kanadeOnlineMode.js b/src/renderer/ctxmenu/kanadeOnlineMode.js
+new file mode 100644
+index 0000000..c628e55
+--- /dev/null
++++ b/src/renderer/ctxmenu/kanadeOnlineMode.js
+@@ -0,0 +1,95 @@
++// Renderer for the versioned tray wire contract; no host endpoints or actions live here.
++const cap = 'kanade-v1'
++export const KANADE_ONLINE_MAX_AGE_MS = 120000
++const words = {
++  component: ['available', 'disabled', 'missing', 'incompatible', 'unavailable'],
++  registration: ['registered', 'unregistered'],
++  control: ['online', 'offline', 'unreachable'],
++  transport: ['standby', 'protected'],
++}
++const validInt = (value) => Number.isSafeInteger(value) && value >= 0
++const inSet = (value, key) => words[key].includes(value) ? value : 'unknown'
++const flag = (value, yes, no) => typeof value === 'boolean' ? (value ? yes : no) : 'unknown'
++
++export function readKanadeOnlineState(raw, { now = Date.now() } = {}) {
++  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { presence: 'unavailable', data: null }
++  const src = raw.kanade
++  if (!Array.isArray(raw.capabilities) || !raw.capabilities.includes(cap) || !src ||
++      src.version !== 1 || !validInt(src.updated_at_ms) || src.updated_at_ms === 0) {
++    return { presence: 'unsupported', data: null }
++  }
++  return expireKanadeOnlineState({ presence: 'supported', at: src.updated_at_ms, data: {
++    component: inSet(src.component, 'component'),
++    registration: inSet(src.registration, 'registration'),
++    control: inSet(src.control, 'control'),
++    count: validInt(src.pending_count) ? src.pending_count : null,
++    transport: inSet(src.transport, 'transport'),
++    connection: flag(src.connection_authorized, 'authorized', 'not_authorized'),
++    pairing: flag(src.native_paired, 'paired', 'unpaired'),
++    streaming: flag(src.streaming, 'active', 'idle'),
++  } }, now)
++}
++
++export function expireKanadeOnlineState(state, now) {
++  return state?.data && Math.abs(now - state.at) > KANADE_ONLINE_MAX_AGE_MS ? { presence: 'stale', data: null } : state
++}
++
++export function kanadeOnlineRows(state) {
++  const data = state?.data
++  if (!data) return [{ id: 'presence', level: state?.presence ?? 'unavailable' }]
++  return [
++    { id: 'component', level: data.component }, { id: 'registration', level: data.registration }, { id: 'control', level: data.control },
++    { id: 'pending', level: data.count === null ? 'unknown' : data.count > 0 ? 'count' : 'none', count: data.count },
++    { id: 'transport', level: data.transport }, { id: 'connection', level: data.connection },
++    { id: 'pairing', level: data.pairing }, { id: 'streaming', level: data.streaming },
++  ]
++}
++
++export function kanadeOnlineActions({ state, busy } = {}) {
++  const data = state?.data
++  const reason = ({ unsupported: 'unsupported_host', unavailable: 'state_unreadable', stale: 'state_stale' })[state?.presence]
++    ?? (data && !['available', 'unknown'].includes(data.component) ? 'component_unavailable'
++      : ['offline', 'unreachable'].includes(data?.control) ? 'control_offline' : 'no_handler')
++  return [
++    { id: 'refresh', enabled: !busy, reason: busy ? 'busy' : '' },
++    { id: 'companion', enabled: false, reason }, { id: 'user_center', enabled: false, reason },
++    { id: 'native_pin', enabled: true, reason: '' },
++  ]
++}
++
++const labels = {
++  'panel.title': ['Online mode', '在线模式'],
++  'panel.description': ['Kanade authorization does not replace the native Sunshine PIN.', 'Kanade 授权不能替代 Sunshine 原生 PIN。'],
++  'note.per_connection': ['Authorization, pairing and streaming are reported separately for this connection.', '授权、配对和串流仅针对当前连接，分别报告。'],
++  'note.absence': ['Local network access and native PIN are still available.', '仍可使用局域网连接与原生 PIN。'],
++  'presence.unsupported': ['This host does not provide a compatible online-mode status.', '当前主机未提供兼容的在线模式状态。'],
++  'presence.unavailable': ['Cannot read the host’s online-mode status.', '暂时无法读取主机的在线模式状态。'],
++  'presence.stale': ['Host status expired. Refresh to check again.', '主机状态已过期，请刷新重试。'],
++  'field.component': ['Kanade component', 'Kanade 组件'], 'field.registration': ['Registration', '登记'],
++  'field.control': ['Control plane', '控制面'], 'field.pending': ['Pending requests', '待处理请求'], 'field.transport': ['Transport', '传输'],
++  'field.connection': ['Kanade connection', 'Kanade 连接'], 'field.pairing': ['Native pairing', '原生配对'], 'field.streaming': ['Streaming', '串流'],
++  available: ['Ready', '正常'], disabled: ['Disabled', '已禁用'], missing: ['Not installed', '未安装'],
++  incompatible: ['Incompatible version', '版本不兼容'], unavailable: ['Unavailable', '不可用'],
++  registered: ['Registered', '已登记'], unregistered: ['Not registered', '未登记'],
++  online: ['Online', '在线'], offline: ['Offline', '离线'], unreachable: ['Unreachable', '不可达'], none: ['None', '没有'],
++  standby: ['Standby', '待命'], protected: ['Protected path ready', '受保护路径已就绪'],
++  authorized: ['Authorized', '已获授权'], not_authorized: ['Not authorized', '未获授权'],
++  paired: ['Paired', '已配对'], unpaired: ['Not paired', '未配对'], active: ['Streaming now', '正在串流'], idle: ['Not streaming', '没有串流'], unknown: ['Unknown', '未知'],
++  'action.refresh': ['Refresh', '刷新'], 'action.companion': ['Open companion', '打开 companion'],
++  'action.user_center': ['Open User Center', '打开 User Center'], 'action.native_pin': ['Enter native PIN', '输入原生 PIN'],
++  'action_reason.busy': ['Reading host status.', '正在读取主机状态。'],
++  'action_reason.no_handler': ['No trusted way to open it.', '尚无可信打开方式。'],
++  'action_reason.unsupported_host': ['No compatible online mode.', '没有兼容的在线模式。'],
++  'action_reason.state_unreadable': ['Host status is unavailable.', '主机状态不可用。'],
++  'action_reason.state_stale': ['Refresh the expired status first.', '请先刷新已过期的状态。'],
++  'action_reason.component_unavailable': ['Kanade is unavailable.', 'Kanade 不可用。'],
++  'action_reason.control_offline': ['Control plane is offline.', '控制面离线。'],
++}
++export function onlineModeText(locale, key) {
++  return labels[key][/^zh/i.test(locale) ? 1 : 0]
++}
++
++export function onlineModeRowText(locale, row) {
++  if (row.level === 'count') return /^zh/i.test(locale) ? `${row.count} 项` : String(row.count)
++  return onlineModeText(locale, row.id === 'presence' ? `presence.${row.level}` : row.level)
++}
+diff --git a/src/renderer/ctxmenu/main.js b/src/renderer/ctxmenu/main.js
+index 1497b95..2168e09 100644
+--- a/src/renderer/ctxmenu/main.js
++++ b/src/renderer/ctxmenu/main.js
+@@ -6,8 +6,13 @@ import { listen } from '@tauri-apps/api/event'
+ import 'foundation-ui/all.css'  // Material 3 Expressive tokens and components
+ import { MMenuPopup, MTrayPopup } from 'foundation-ui/popup'
+ import { popupTransport, trayTransport } from '../composables/menuPopupTransport.js'
++import TrayOnlineMode from './TrayOnlineMode.vue'
+ 
+ // one window, two pages in it: the context menus of the main window (MMenuPopup) and the tray icon's menus (MTrayPopup, src-tauri/src/tray/popup_input.rs); each answers only its own events
+ const menus = popupTransport({ invoke, listen })
+ const tray = trayTransport({ invoke, listen })
+-createApp({ render: () => [h(MMenuPopup, { transport: menus }), h(MTrayPopup, { transport: tray })] }).mount('#app')
++createApp({
++  render: () => [h(MMenuPopup, { transport: menus }), h(MTrayPopup, { transport: tray }, {
++    'start-page': ({ state, token }) => h(TrayOnlineMode, { key: token, state, token, transport: tray }),
++  })],
++}).mount('#app')
+diff --git a/src/renderer/ctxmenu/trayOnlineMode.js b/src/renderer/ctxmenu/trayOnlineMode.js
+new file mode 100644
+index 0000000..961a7eb
+--- /dev/null
++++ b/src/renderer/ctxmenu/trayOnlineMode.js
+@@ -0,0 +1,48 @@
++import { expireKanadeOnlineState, readKanadeOnlineState } from './kanadeOnlineMode.js'
++
++/** Shared projection plus the popup's short-lived, token-scoped read lifecycle. */
++export function createTrayOnlineMode({ read, publish, now = Date.now, repeat = setInterval, stop = clearInterval }) {
++  let disposed = false
++  let receipt = 0
++  let busy = false
++  let current = null
++  let lastMonitor
++
++  function receive(raw) {
++    if (disposed) return
++    receipt++
++    current = readKanadeOnlineState(raw, { now: now() })
++    publish(current, busy)
++  }
++
++  function checkAge() {
++    if (disposed) return
++    const next = expireKanadeOnlineState(current, now())
++    if (next !== current) { current = next; publish(current, busy) }
++  }
++
++  // Other tray events may carry the same projection; they must not undo a
++  // manual refresh or keep old values alive. A changed snapshot wins races.
++  function receiveMonitor(raw) {
++    const key = JSON.stringify(raw)
++    if (lastMonitor === key) return
++    lastMonitor = key
++    receive(raw)
++  }
++
++  async function refresh() {
++    if (disposed || busy) return
++    const begun = receipt
++    busy = true
++    publish(current, busy)
++    let raw = null
++    try { raw = await read() } catch { /* make any failed read unavailable */ }
++    if (disposed) return
++    busy = false
++    if (begun === receipt) receive(raw)
++    else publish(current, busy)
++  }
++
++  const timer = repeat(checkAge, 1000)
++  return { receiveMonitor, refresh, checkAge, dispose() { disposed = true; stop(timer) } }
++}
+diff --git a/src/renderer/ctxmenu/trayOnlineMode.test.js b/src/renderer/ctxmenu/trayOnlineMode.test.js
+new file mode 100644
+index 0000000..e570fcb
+--- /dev/null
++++ b/src/renderer/ctxmenu/trayOnlineMode.test.js
+@@ -0,0 +1,120 @@
++import assert from 'node:assert/strict'
++import { readFileSync } from 'node:fs'
++import test from 'node:test'
++import { pathToFileURL } from 'node:url'
++import { trayTransport } from '../composables/menuPopupTransport.js'
++import { KANADE_ONLINE_MAX_AGE_MS, kanadeOnlineActions, kanadeOnlineRows } from './kanadeOnlineMode.js'
++import { createTrayOnlineMode } from './trayOnlineMode.js'
++
++const timestamp = 1_764_153_600_123
++const tray = (fields = {}) => ({ capabilities: ['kanade-v1'], kanade: { version: 1, updated_at_ms: timestamp, ...fields } })
++const available = (state) => kanadeOnlineActions({ state }).filter((action) => action.enabled).map((action) => action.id)
++function harness(read = async () => null) {
++  const updates = []
++  let at = timestamp
++  let tick
++  const mode = createTrayOnlineMode({ read, now: () => at, repeat: (fn) => { tick = fn; return 1 },
++    stop: (id) => { assert.equal(id, 1); tick = null }, publish: (...snapshot) => updates.push(snapshot) })
++  return { ...mode, updates, latest: () => updates.at(-1), advance: (ms) => { at += ms; tick?.() } }
++}
++
++test('tray numbers are counts only and the four connection states remain independent', () => {
++  const mode = harness()
++  mode.receiveMonitor({ ...tray({ control: 'online', registration: 'registered', transport: 'protected', pending_count: 3,
++    native_paired: false, streaming: false }), sessions: [{ id: 10 }] })
++  const [current] = mode.latest()
++  const levels = Object.fromEntries(kanadeOnlineRows(current).map((row) => [row.id, row.level]))
++  assert.deepEqual(levels, { component: 'unknown', registration: 'registered', control: 'online', pending: 'count',
++    transport: 'protected', connection: 'unknown', pairing: 'unpaired', streaming: 'idle' })
++  assert.equal(kanadeOnlineRows(current).find((row) => row.id === 'pending').count, 3)
++  assert.deepEqual(available(current), ['refresh', 'native_pin'])
++  mode.advance(KANADE_ONLINE_MAX_AGE_MS + 1)
++  assert.equal(mode.latest()[0].presence, 'stale')
++  assert.equal(mode.latest()[0].data, null)
++})
++
++test('disconnected, old, incompatible, disabled and control-plane offline are fail-closed', () => {
++  const mode = harness()
++  for (const [raw, expected] of [[null, 'unavailable'], [{}, 'unsupported'], [tray({ version: 2 }), 'unsupported'],
++    [tray({ component: 'disabled' }), 'supported'], [tray({ component: 'missing' }), 'supported'],
++    [tray({ registration: 'unregistered' }), 'supported'], [tray({ control: 'offline' }), 'supported']]) {
++    mode.receiveMonitor(raw)
++    const [current] = mode.latest()
++    assert.equal(current.presence, expected)
++    assert.notEqual(current.data?.control, 'online')
++    assert.deepEqual(available(current), ['refresh', 'native_pin'])
++  }
++})
++
++test('refresh clears failed state; newer monitor data wins and duplicate events cannot overwrite a refresh', async () => {
++  let resolve
++  const mode = harness(() => new Promise((done) => { resolve = done }))
++  const old = tray({ control: 'online' })
++  const offline = tray({ control: 'offline' })
++  mode.receiveMonitor(old)
++  const first = mode.refresh()
++  assert.equal(mode.latest()[1], true)
++  mode.receiveMonitor(offline)
++  resolve(old)
++  await first
++  assert.equal(mode.latest()[0].data.control, 'offline')
++  const second = mode.refresh()
++  resolve(null)
++  await second
++  mode.receiveMonitor(offline)
++  assert.equal(mode.latest()[0].presence, 'unavailable')
++  mode.receiveMonitor(old)
++  assert.equal(mode.latest()[0].data.control, 'online')
++  const refused = harness(async () => { throw Error('read refused') })
++  refused.receiveMonitor(old)
++  await refused.refresh()
++  assert.equal(refused.latest()[0].data, null)
++})
++
++test('closing the popup releases the timer and discards late refreshes', async () => {
++  let complete
++  const mode = harness(() => new Promise((resolve) => { complete = resolve }))
++  mode.receiveMonitor(null)
++  const result = mode.refresh()
++  mode.dispose()
++  complete(tray({ control: 'online' }))
++  await result
++  mode.advance(KANADE_ONLINE_MAX_AGE_MS + 1)
++  assert.equal(mode.updates.length, 2)
++})
++
++test('popup transport sends only a scoped read and existing native PIN navigation', async () => {
++  const calls = []
++  const transport = trayTransport({ listen: () => {}, invoke: async (...args) => { calls.push(args); return { capabilities: [] } } })
++  assert.deepEqual(await transport.refreshOnlineMode(42), { capabilities: [] })
++  await transport.act(42, 'online_native_pin')
++  assert.deepEqual(calls, [['tray_popup_refresh_online_mode', { token: 42 }], ['tray_popup_act', { token: 42, id: 'online_native_pin' }]])
++  const ui = readFileSync(new URL('./TrayOnlineMode.vue', import.meta.url), 'utf8')
++  assert.match(ui, /transport\.act\(props\.token, 'online_native_pin'\)/)
++  assert.doesNotMatch(ui, /\bfetch\b|local-auth\.token|https?:\/\/|shell\.open/)
++  const rust = readFileSync(new URL('../../../src-tauri/src/tray.rs', import.meta.url), 'utf8')
++  assert.match(rust, /if id == "online_native_pin" \{\s+if window\.label\(\) == crate::ctx_popup::POPUP_LABEL[\s\S]+?if crate::ctx_popup::pick_tray\(&handle, token\) \{\s+actions::open_pairing_window\(&handle\)/)
++  const actions = readFileSync(new URL('../../../src-tauri/src/tray/actions.rs', import.meta.url), 'utf8')
++  assert.match(actions, /fn open_pairing_window[\s\S]+?get_local_sunshine_url\(\)[\s\S]+?windows::open_pin_window\(&pin_handle\)/)
++})
++
++const webContract = process.env.FOUNDATION_ONLINE_WEB_CONTRACT
++test('the WebUI and tray project the same contract fixtures', { skip: !webContract }, async () => {
++  const web = await import(pathToFileURL(webContract).href)
++  const cases = [null, {}, { kanade: tray().kanade }, { capabilities: ['kanade-v1'] }, tray({ version: 2 }),
++    tray({ updated_at_ms: String(timestamp) }), tray({ updated_at_ms: timestamp - KANADE_ONLINE_MAX_AGE_MS - 1 }),
++    ...['disabled', 'missing', 'incompatible', 'unavailable'].map((component) => tray({ component })),
++    tray({ control: 'unreachable', transport: 'standby', registration: 'unregistered', pending_count: 0 }),
++    tray({ component: 'available', control: 'online', registration: 'registered', transport: 'protected', pending_count: 2,
++      connection_authorized: true, native_paired: false, streaming: true }),
++    tray({ pending_count: '2', connection_authorized: 1, native_paired: null, streaming: 'true' })]
++  const summary = (rows) => rows.map(({ id, level, count }) => [id, level, count ?? null])
++  for (const raw of cases) {
++    const webState = web.readKanadeOnlineState(raw, { now: timestamp })
++    const mode = harness()
++    mode.receiveMonitor(raw)
++    const [trayState] = mode.latest()
++    assert.deepEqual(summary(kanadeOnlineRows(trayState)), summary(web.kanadeOnlineRows(webState)))
++    assert.deepEqual(kanadeOnlineActions({ state: trayState }), web.kanadeOnlineActions({ state: webState }))
++  }
++})

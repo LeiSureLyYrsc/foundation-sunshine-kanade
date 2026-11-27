@@ -104,6 +104,9 @@ namespace {
 
       std::error_code ec;
       fs::remove(state_file_, ec);
+      auto lock = state_file_;
+      lock += ".lock";
+      fs::remove(lock, ec);
       if (remove_directory_) {
         fs::remove(state_file_.parent_path(), ec);
       }

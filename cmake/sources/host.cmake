@@ -54,6 +54,7 @@ set(SUNSHINE_HOST_SOURCES
     src/nvhttp.cpp src/nvhttp.h
     src/nvhttp_stream_start.cpp src/nvhttp_stream_start.h
     src/httpcommon.cpp src/httpcommon.h
+    src/state_json.h
     src/http_json.cpp
     src/launch_session_manager.cpp src/launch_session_manager.h
     src/confighttp.cpp src/confighttp.h

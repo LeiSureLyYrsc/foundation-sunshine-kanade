@@ -41,6 +41,7 @@
 #include "nvhttp.h"
 #include "platform/common.h"
 #include "rtsp.h"
+#include "state_json.h"
 #include "utility.h"
 #include "uuid.h"
 
@@ -94,31 +95,18 @@ namespace http {
 
   int
   save_user_creds(const std::string &file, const std::string &username, const std::string &password, bool run_our_mouth) {
-    pt::ptree outputTree;
-
-    if (fs::exists(file_handler::path_from_utf8(file))) {
-      try {
-        file_handler::read_json(file, outputTree);
-      }
-      catch (std::exception &e) {
-        BOOST_LOG(error) << "Couldn't read user credentials: "sv << e.what();
-        return -1;
-      }
-    }
-
     auto salt = crypto::rand_alphabet(16);
     if (salt.size() != 16) {
       BOOST_LOG(error) << "Couldn't generate a random salt for the credentials file"sv;
       return -1;
     }
-    outputTree.put("username", username);
-    outputTree.put("salt", salt);
-    outputTree.put("password", util::hex(crypto::hash(password + salt)).to_string());
-    try {
-      file_handler::write_json(file, outputTree);
-    }
-    catch (std::exception &e) {
-      BOOST_LOG(error) << "error writing to the credentials file, perhaps try this again as an administrator? Details: "sv << e.what();
+    const auto verifier = util::hex(crypto::hash(password + salt)).to_string();
+    if (!state_json::transact(file_handler::path_from_utf8(file), [&](auto &document) {
+          document["username"] = username;
+          document["salt"] = salt;
+          document["password"] = verifier;
+          return true;
+        })) {
       return -1;
     }
 

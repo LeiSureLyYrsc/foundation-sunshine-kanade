@@ -58,6 +58,26 @@ namespace tray_state {
     bool operator==(const touch_keyboard_t &) const = default;
   };
 
+  enum class kanade_component_e { available, disabled, missing, incompatible, unavailable };
+  enum class kanade_registration_e { registered, unregistered };
+  enum class kanade_control_e { online, offline, unreachable };
+  enum class kanade_transport_e { standby, protected_path };
+
+  /// A minimal, independently observed snapshot from a trusted in-process producer.
+  struct kanade_status_t {
+    std::int64_t updated_at_ms = 0;  ///< Observation time, never the time the tray responds.
+    std::optional<kanade_component_e> component;
+    std::optional<kanade_registration_e> registration;
+    std::optional<kanade_control_e> control;
+    std::optional<std::uint64_t> pending_count;
+    std::optional<kanade_transport_e> transport;
+    std::optional<bool> connection_authorized;
+    std::optional<bool> native_paired;
+    std::optional<bool> streaming;
+
+    bool operator==(const kanade_status_t &) const = default;
+  };
+
   /// The launch splash the GUI agent draws (src/launch_splash). `id` stays after the launch ends, with active false, so the agent closes the splash of that id.
   struct launch_t {
     std::string id;
@@ -88,6 +108,7 @@ namespace tray_state {
     launch_t launch;
     std::vector<client_session_t> sessions;
     std::optional<touch_keyboard_t> touch_keyboard;
+    std::optional<kanade_status_t> kanade;
     std::uint64_t revision = 0;
     std::int64_t updated_at_ms = 0;
   };
@@ -150,6 +171,10 @@ namespace tray_state {
   /// The GUI applies this preference only in the matching desktop session.
   void
   set_touch_keyboard(std::optional<touch_keyboard_t> preference);
+
+  /// Only a trusted producer may publish; pass nullopt when that source is withdrawn.
+  void
+  set_kanade_status(std::optional<kanade_status_t> status);
 
   /// Publishes the state of the launch splash. Nothing is published (no revision, no event) when it equals the one already there.
   void
